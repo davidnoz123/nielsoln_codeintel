@@ -828,6 +828,17 @@ class CodeIndexDb:
         ).fetchone()
         return row["id"]
 
+    def get_source_file_id(
+        self, branch_id: int, file_path: str
+    ) -> Optional[int]:
+        """Return the existing source_file ID without modifying any rows."""
+        row = self._conn.execute(
+            "SELECT id FROM source_file "
+            "WHERE branch_id = ? AND file_path = ?",
+            (branch_id, file_path),
+        ).fetchone()
+        return row["id"] if row else None
+
     # ------------------------------------------------------------------
     # Code entity
 
@@ -1526,6 +1537,12 @@ class CodeScanner:
                     f"{rel_path}",
                     file=sys.stderr,
                 )
+                # If a previous successful scan created a source_file row,
+                # preserve its ID so the vanished-file detector below does not
+                # mistake this file for one that was deleted from disk.
+                existing_sf_id = db.get_source_file_id(branch_id, rel_path)
+                if existing_sf_id is not None:
+                    scanned_file_ids.add(existing_sf_id)
                 continue
 
             source_file_id = db.upsert_source_file(
