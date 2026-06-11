@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import json
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -561,6 +562,58 @@ def test_new_commands() -> None:
 
 
 # ---------------------------------------------------------------------------
+# I. Published command registry: commands, help-json
+# ---------------------------------------------------------------------------
+
+
+def test_published_command_registry() -> None:
+    print("\nI. Published command registry: commands, help-json")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+
+        # A simple module so status/orient/stale have something to report.
+        (tmp / "greet.py").write_text(
+            'def hello(name):\n    """Say hello."""\n    return f"Hello, {name}"\n',
+            encoding="utf-8",
+        )
+        run_ci(["scan", str(tmp)], tmp)
+
+        # commands
+        r_cmds = run_ci(["commands"], tmp)
+        _assert("I: commands exits 0", r_cmds.returncode == 0, r_cmds.stderr.strip())
+        for token in ("scan", "status", "orient", "drifts"):
+            _assert(f"I: commands output includes {token}",
+                token in r_cmds.stdout, r_cmds.stdout.strip())
+
+        # help-json
+        r_help = run_ci(["help-json"], tmp)
+        _assert("I: help-json exits 0", r_help.returncode == 0, r_help.stderr.strip())
+        parsed = None
+        try:
+            parsed = json.loads(r_help.stdout)
+            _assert("I: help-json parses as JSON", True)
+        except json.JSONDecodeError as exc:
+            _assert("I: help-json parses as JSON", False, str(exc))
+        if parsed is not None:
+            names = {entry.get("command") for entry in parsed}
+            _assert("I: help-json describes published commands",
+                {"scan", "status", "orient", "drifts"}.issubset(names),
+                sorted(names))
+
+        # Existing commands still work via the registry.
+        r_status = run_ci(["status"], tmp)
+        _assert("I: status still works", r_status.returncode == 0, r_status.stderr.strip())
+
+        r_orient = run_ci(["orient", "hello"], tmp)
+        _assert("I: orient still works", r_orient.returncode == 0, r_orient.stderr.strip())
+        _assert("I: orient still finds entity",
+            "greet.hello" in r_orient.stdout, r_orient.stdout.strip())
+
+        r_stale = run_ci(["stale"], tmp)
+        _assert("I: stale still works", r_stale.returncode == 0, r_stale.stderr.strip())
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -578,6 +631,7 @@ def main() -> None:
     test_removed_and_restored()
     test_sql_qnames()
     test_new_commands()
+    test_published_command_registry()
 
     total  = len(_results)
     passed = sum(1 for _, ok, _ in _results if ok)

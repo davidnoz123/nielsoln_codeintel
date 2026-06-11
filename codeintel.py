@@ -16,11 +16,14 @@ DB path: .codeintel/codeintel.sqlite  (relative to cwd)
 import ast
 import datetime
 import hashlib
+import inspect
+import json
 import re
 import sqlite3
 import sys
+import typing
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # Version constants
@@ -1669,6 +1672,273 @@ def _open_db(require_existing: bool = False) -> CodeIndexDb:
 
 
 # ---------------------------------------------------------------------------
+# Published command registry
+#
+# A small, reusable command-publishing pattern.  It is deliberately
+# standard-library-only and free of argparse, so it can be lifted into other
+# repositories unchanged.  Commands are plain callables; their command-line
+# interface is derived by introspecting the callable's signature.
+#
+# Conversion rules (no eval is ever used):
+#   * A single parameter annotated ``List[str]`` receives all remaining
+#     command-line arguments as a list of strings (variadic style).  This is
+#     the convention used by the built-in CodeIntel commands.
+#   * str / int / float / bool parameters convert one positional argument each.
+#   * list / dict parameters are parsed with json.loads (and validated).
+#   * Optional[str|int|float|bool] accepts the literals "none"/"null" (and the
+#     empty string) as None, otherwise converts as the inner scalar type.
+# ---------------------------------------------------------------------------
+
+_NONE_TYPE = type(None)
+
+
+class CommandError(Exception):
+    """Raised when command-line arguments cannot be bound to a command."""
+
+
+def _parse_bool(raw: str) -> bool:
+    low = raw.strip().lower()
+    if low in ("1", "true", "yes", "y", "on"):
+        return True
+    if low in ("0", "false", "no", "n", "off"):
+        return False
+    raise CommandError(f"invalid boolean value: {raw!r}")
+
+
+def _is_str_list(annotation: object) -> bool:
+    """True only for the variadic ``List[str]`` convention."""
+    return typing.get_origin(annotation) is list and typing.get_args(annotation) == (str,)
+
+
+def _convert_scalar(raw: str, scalar_type: object) -> object:
+    if scalar_type is str:
+        return raw
+    if scalar_type is int:
+        try:
+            return int(raw)
+        except ValueError:
+            raise CommandError(f"invalid integer value: {raw!r}")
+    if scalar_type is float:
+        try:
+            return float(raw)
+        except ValueError:
+            raise CommandError(f"invalid float value: {raw!r}")
+    if scalar_type is bool:
+        return _parse_bool(raw)
+    # Unknown scalar — pass the raw string through unchanged.
+    return raw
+
+
+def _convert_value(raw: str, annotation: object) -> object:
+    if annotation is inspect.Parameter.empty or annotation is str:
+        return raw
+
+    origin = typing.get_origin(annotation)
+    args = typing.get_args(annotation)
+
+    # Optional[X] / Union[X, None]
+    if origin is typing.Union:
+        non_none = [a for a in args if a is not _NONE_TYPE]
+        if len(args) == 2 and len(non_none) == 1:
+            if raw.strip().lower() in ("none", "null", ""):
+                return None
+            return _convert_scalar(raw, non_none[0])
+        raise CommandError(f"unsupported Union annotation: {annotation!r}")
+
+    # list via JSON
+    if annotation is list or origin is list:
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise CommandError(f"invalid JSON list: {exc}")
+        if not isinstance(parsed, list):
+            raise CommandError("expected a JSON list value")
+        return parsed
+
+    # dict via JSON
+    if annotation is dict or origin is dict:
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise CommandError(f"invalid JSON object: {exc}")
+        if not isinstance(parsed, dict):
+            raise CommandError("expected a JSON object value")
+        return parsed
+
+    return _convert_scalar(raw, annotation)
+
+
+def _annotation_name(annotation: object) -> str:
+    if annotation is inspect.Parameter.empty:
+        return "str"
+
+    origin = typing.get_origin(annotation)
+    if origin is typing.Union:
+        args = typing.get_args(annotation)
+        non_none = [a for a in args if a is not _NONE_TYPE]
+        if len(args) == 2 and len(non_none) == 1:
+            return f"Optional[{_annotation_name(non_none[0])}]"
+        return " | ".join(_annotation_name(a) for a in args)
+    if origin is list:
+        sub = typing.get_args(annotation)
+        return f"List[{_annotation_name(sub[0])}]" if sub else "list"
+    if origin is dict:
+        return "dict"
+    if hasattr(annotation, "__name__"):
+        return annotation.__name__
+    return str(annotation).replace("typing.", "")
+
+
+def _first_doc_line(func: Callable) -> str:
+    doc = inspect.getdoc(func) or ""
+    for line in doc.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return ""
+
+
+class _CommandSpec:
+    """Introspected metadata for a single published command."""
+
+    def __init__(
+        self,
+        name: str,
+        func: Callable,
+        aliases: Tuple[str, ...] = (),
+        summary: Optional[str] = None,
+    ) -> None:
+        self.name = name
+        self.func = func
+        self.aliases = aliases
+        self.summary = summary or _first_doc_line(func)
+        self.params = [
+            p
+            for p in inspect.signature(func).parameters.values()
+            if p.kind
+            in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            )
+        ]
+
+    def describe(self) -> Dict[str, Any]:
+        parameters = []
+        for p in self.params:
+            has_default = p.default is not inspect.Parameter.empty
+            parameters.append(
+                {
+                    "name": p.name,
+                    "type": _annotation_name(p.annotation),
+                    "required": not has_default and not _is_str_list(p.annotation),
+                    "default": p.default if has_default else None,
+                    "variadic": _is_str_list(p.annotation),
+                }
+            )
+        return {
+            "command": self.name,
+            "aliases": list(self.aliases),
+            "parameters": parameters,
+            "summary": self.summary,
+        }
+
+
+class PublishedCommandRegistry:
+    """
+    Lightweight registry that publishes named commands and runs them from
+    ``sys.argv``-style argument lists.
+
+    Names containing underscores are also reachable via their dash form (and
+    vice versa), so ``help_json`` and ``help-json`` resolve to the same
+    command.
+    """
+
+    def __init__(self) -> None:
+        self._specs: Dict[str, _CommandSpec] = {}
+        self._aliases: Dict[str, str] = {}
+
+    def register(
+        self,
+        name: str,
+        func: Callable,
+        *,
+        aliases: Optional[List[str]] = None,
+        summary: Optional[str] = None,
+    ) -> Callable:
+        all_aliases = list(aliases or [])
+        # Auto-generate dash/underscore aliases.
+        if "_" in name and name.replace("_", "-") not in all_aliases:
+            all_aliases.append(name.replace("_", "-"))
+        if "-" in name and name.replace("-", "_") not in all_aliases:
+            all_aliases.append(name.replace("-", "_"))
+
+        spec = _CommandSpec(name, func, tuple(all_aliases), summary)
+        self._specs[name] = spec
+        for alias in spec.aliases:
+            self._aliases[alias] = name
+        return func
+
+    def resolve(self, token: str) -> Optional[_CommandSpec]:
+        if token in self._specs:
+            return self._specs[token]
+        canonical = self._aliases.get(token)
+        return self._specs[canonical] if canonical is not None else None
+
+    def names(self) -> List[str]:
+        return sorted(self._specs)
+
+    def specs(self) -> List[_CommandSpec]:
+        return [self._specs[n] for n in self.names()]
+
+    def _bind(self, spec: _CommandSpec, rest: List[str]) -> List[object]:
+        values: List[object] = []
+        i = 0
+        for p in spec.params:
+            if _is_str_list(p.annotation):
+                values.append(list(rest[i:]))
+                i = len(rest)
+                continue
+            if i < len(rest):
+                values.append(_convert_value(rest[i], p.annotation))
+                i += 1
+            elif p.default is not inspect.Parameter.empty:
+                values.append(p.default)
+            else:
+                raise CommandError(f"missing required argument: {p.name}")
+        return values
+
+    def print_usage(self, unknown: Optional[str] = None) -> None:
+        if unknown is not None:
+            print(f"Unknown command: {unknown}", file=sys.stderr)
+        print("Usage: codeintel.py <command> [args]")
+        print()
+        for spec in self.specs():
+            print(f"  {spec.name:<11} {spec.summary}")
+
+    def run(self, argv: List[str]) -> int:
+        if not argv:
+            self.print_usage()
+            return 0
+
+        spec = self.resolve(argv[0])
+        if spec is None:
+            self.print_usage(unknown=argv[0])
+            return 1
+
+        try:
+            bound = self._bind(spec, argv[1:])
+        except CommandError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+
+        spec.func(*bound)
+        return 0
+
+
+REGISTRY = PublishedCommandRegistry()
+
+
+# ---------------------------------------------------------------------------
 # CLI commands
 # ---------------------------------------------------------------------------
 
@@ -1954,36 +2224,48 @@ def cmd_stale(args: List[str]) -> None:
     db.close()
 
 
+def cmd_commands(args: List[str]) -> None:
+    """List published commands and one-line descriptions."""
+    print("Available commands:")
+    for spec in REGISTRY.specs():
+        print(f"  {spec.name:<11} {spec.summary}")
+
+
+def cmd_help_json(args: List[str]) -> None:
+    """Print machine-readable command help as JSON."""
+    payload = [spec.describe() for spec in REGISTRY.specs()]
+    print(json.dumps(payload, indent=2, default=str))
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
-_COMMANDS = {
-    "scan":   cmd_scan,
-    "map":    cmd_map,
-    "find":   cmd_find,
-    "stale":  cmd_stale,
-    "status": cmd_status,
-    "orient": cmd_orient,
-    "drifts": cmd_drifts,
-}
+REGISTRY.register("scan", cmd_scan, summary="scan a file or directory tree")
+REGISTRY.register("map", cmd_map, summary="show current entity map")
+REGISTRY.register(
+    "find", cmd_find, summary="find active entities by name (substring match)"
+)
+REGISTRY.register(
+    "stale", cmd_stale, summary="list source files modified since last scan"
+)
+REGISTRY.register("status", cmd_status, summary="show DB health and scan statistics")
+REGISTRY.register(
+    "orient", cmd_orient, summary="show rich orientation info for an entity (agent use)"
+)
+REGISTRY.register("drifts", cmd_drifts, summary="list open drift events")
+REGISTRY.register(
+    "commands", cmd_commands, summary="list published commands and descriptions"
+)
+REGISTRY.register(
+    "help-json", cmd_help_json, summary="print machine-readable command help as JSON"
+)
 
 
 def main() -> None:
-    argv = sys.argv[1:]
-    if not argv or argv[0] not in _COMMANDS:
-        print("Usage: codeintel.py <command> [args]")
-        print()
-        print("  scan <path>   scan a file or directory tree")
-        print("  map           show current entity map")
-        print("  find <name>   find active entities by name (substring match)")
-        print("  stale         list source files modified since last scan")
-        print("  status        show DB health and scan statistics")
-        print("  orient <name> show rich orientation info for an entity (agent use)")
-        print("  drifts        list open drift events")
-        sys.exit(0 if not argv else 1)
-
-    _COMMANDS[argv[0]](argv[1:])
+    exit_code = REGISTRY.run(sys.argv[1:])
+    if exit_code:
+        sys.exit(exit_code)
 
 
 if __name__ == "__main__":
