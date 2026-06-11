@@ -1761,6 +1761,171 @@ def cmd_find(args: List[str]) -> None:
     db.close()
 
 
+def cmd_status(args: List[str]) -> None:
+    db = _open_db(require_existing=True)
+
+    # Meta values
+    def _meta(key: str) -> str:
+        rows = db.query("SELECT value FROM meta WHERE key = ?", (key,))
+        return rows[0]["value"] if rows else "?"
+
+    schema_v  = _meta("schema_version")
+    scanner_v = _meta("scanner_version")
+
+    print(f"DB path         : {db.db_path}")
+    print(f"schema_version  : {schema_v}")
+    print(f"scanner_version : {scanner_v}")
+
+    # Repos and branches
+    repo_rows = db.query(
+        "SELECT gr.repo_slug, gr.root_path, gb.branch_name "
+        "FROM git_branch gb "
+        "JOIN git_repo gr ON gr.id = gb.repo_id "
+        "ORDER BY gr.repo_slug, gb.branch_name"
+    )
+    print(f"repos/branches  : {len(repo_rows)}")
+    for row in repo_rows:
+        print(f"  {row['repo_slug']} / {row['branch_name']}  ({row['root_path']})")
+
+    # Latest scan run
+    latest = db.query(
+        "SELECT id, status, started_at, finished_at, "
+        "       files_scanned, entities_observed, drifts_detected "
+        "FROM scan_run "
+        "ORDER BY id DESC LIMIT 1"
+    )
+    if latest:
+        sr = latest[0]
+        print(
+            f"latest scan run : id={sr['id']}  status={sr['status']}  "
+            f"started={sr['started_at']}  finished={sr['finished_at'] or '-'}  "
+            f"files={sr['files_scanned']}  entities={sr['entities_observed']}  "
+            f"drifts={sr['drifts_detected']}"
+        )
+    else:
+        print("latest scan run : none")
+
+    # Counts
+    active_entities = db.query(
+        "SELECT COUNT(*) AS n FROM code_entity WHERE lifecycle_status = 'active'"
+    )[0]["n"]
+    source_files = db.query("SELECT COUNT(*) AS n FROM source_file")[0]["n"]
+    open_drifts  = db.query(
+        "SELECT COUNT(*) AS n FROM drift_event WHERE status = 'open'"
+    )[0]["n"]
+    failed_runs  = db.query(
+        "SELECT COUNT(*) AS n FROM scan_run WHERE status = 'failed'"
+    )[0]["n"]
+
+    # Stale count reuses the same logic as cmd_stale
+    sf_rows = db.get_source_files_for_stale()
+    stale_count = 0
+    for row in sf_rows:
+        p = Path(row["root_path"]) / row["file_path"]
+        if not p.exists() or _hash_file(p) != row["file_hash"]:
+            stale_count += 1
+
+    print(f"active entities : {active_entities}")
+    print(f"source files    : {source_files}")
+    print(f"stale files     : {stale_count}")
+    print(f"open drifts     : {open_drifts}")
+    print(f"failed runs     : {failed_runs}")
+
+    db.close()
+
+
+def cmd_orient(args: List[str]) -> None:
+    """
+    Agent-facing entity lookup.  Prints rich orientation information for
+    each active entity whose qualified_name or name matches the search term.
+    """
+    if not args:
+        print("Usage: codeintel.py orient <name>", file=sys.stderr)
+        sys.exit(1)
+
+    name = args[0]
+    db = _open_db(require_existing=True)
+    escaped = _like_escape(name)
+
+    rows = db.query(
+        "SELECT entity_id, qualified_name, entity_type, file_path, "
+        "       start_line, end_line, language, detection_method "
+        "FROM v_entity_current "
+        "WHERE qualified_name LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\' "
+        "ORDER BY file_path, start_line",
+        (f"%{escaped}%", f"%{escaped}%"),
+    )
+
+    if not rows:
+        print(f"No active entities matching '{name}'.")
+        db.close()
+        return
+
+    for row in rows:
+        fp = row["file_path"] or ""
+        loc = f"{fp}:{row['start_line']}-{row['end_line']}" if fp else ""
+        print(f"[{row['entity_type']}] {row['qualified_name']}")
+        if loc:
+            print(f"  location  : {loc}")
+        print(f"  language  : {row['language'] or '-'}")
+        print(f"  detection : {row['detection_method'] or '-'}")
+
+        # Signature text
+        sig = db.query(
+            "SELECT text_body FROM entity_text "
+            "WHERE entity_id = ? AND text_kind = 'signature'",
+            (row["entity_id"],),
+        )
+        if sig:
+            print(f"  signature : {sig[0]['text_body']}")
+
+        # Docstring — first paragraph only
+        doc = db.query(
+            "SELECT text_body FROM entity_text "
+            "WHERE entity_id = ? AND text_kind = 'docstring'",
+            (row["entity_id"],),
+        )
+        if doc:
+            first_para = doc[0]["text_body"].split("\n\n")[0].strip()
+            print(f"  docstring : {first_para}")
+
+        print()
+
+    db.close()
+
+
+def cmd_drifts(args: List[str]) -> None:
+    db = _open_db(require_existing=True)
+    rows = db.query(
+        "SELECT drift_event_id, scan_run_id, drift_kind, "
+        "       qualified_name, entity_type, file_path, start_line, "
+        "       old_hash, new_hash, status "
+        "FROM v_open_drifts "
+        "ORDER BY drift_event_id"
+    )
+
+    if not rows:
+        print("No open drift events.")
+        db.close()
+        return
+
+    print(f"Open drifts ({len(rows)}):")
+    for row in rows:
+        fp = row["file_path"] or ""
+        loc = f"{fp}:{row['start_line']}" if fp and row["start_line"] is not None else fp
+        old_h = (row["old_hash"] or "")[:10] or "-"
+        new_h = (row["new_hash"] or "")[:10] or "-"
+        print(
+            f"  [{row['drift_kind']:8}] id={row['drift_event_id']} "
+            f"run={row['scan_run_id']} "
+            f"{row['qualified_name']} ({row['entity_type']}) "
+            f"@ {loc}  "
+            f"old={old_h} new={new_h}"
+        )
+
+    db.close()
+
+
 def cmd_stale(args: List[str]) -> None:
     """
     Report source files whose on-disk sha256 no longer matches the stored
@@ -1794,22 +1959,28 @@ def cmd_stale(args: List[str]) -> None:
 # ---------------------------------------------------------------------------
 
 _COMMANDS = {
-    "scan":  cmd_scan,
-    "map":   cmd_map,
-    "find":  cmd_find,
-    "stale": cmd_stale,
+    "scan":   cmd_scan,
+    "map":    cmd_map,
+    "find":   cmd_find,
+    "stale":  cmd_stale,
+    "status": cmd_status,
+    "orient": cmd_orient,
+    "drifts": cmd_drifts,
 }
 
 
 def main() -> None:
     argv = sys.argv[1:]
     if not argv or argv[0] not in _COMMANDS:
-        print("Usage: codeintel.py <scan|map|find|stale> [args]")
+        print("Usage: codeintel.py <command> [args]")
         print()
         print("  scan <path>   scan a file or directory tree")
         print("  map           show current entity map")
         print("  find <name>   find active entities by name (substring match)")
         print("  stale         list source files modified since last scan")
+        print("  status        show DB health and scan statistics")
+        print("  orient <name> show rich orientation info for an entity (agent use)")
+        print("  drifts        list open drift events")
         sys.exit(0 if not argv else 1)
 
     _COMMANDS[argv[0]](argv[1:])

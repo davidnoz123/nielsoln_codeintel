@@ -511,6 +511,56 @@ def test_sql_qnames() -> None:
 
 
 # ---------------------------------------------------------------------------
+# H. New agent commands: status, orient, drifts
+# ---------------------------------------------------------------------------
+
+
+def test_new_commands() -> None:
+    print("\nH. New agent commands: status, orient, drifts")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+
+        # Create a module with a documented function so orient has something
+        # rich to print.
+        (tmp / "greet.py").write_text(
+            'def hello(name):\n    """Say hello."""\n    return f"Hello, {name}"\n',
+            encoding="utf-8",
+        )
+        run_ci(["scan", str(tmp)], tmp)
+
+        # status
+        r_status = run_ci(["status"], tmp)
+        _assert("H: status exits 0", r_status.returncode == 0, r_status.stderr.strip())
+        _assert("H: status shows schema_version",
+            "schema_version" in r_status.stdout, r_status.stdout[:200])
+        _assert("H: status shows active entities count",
+            "active entities" in r_status.stdout, r_status.stdout[:200])
+        _assert("H: status shows latest scan run",
+            "latest scan run" in r_status.stdout, r_status.stdout[:200])
+
+        # orient — look up a known function
+        r_orient = run_ci(["orient", "hello"], tmp)
+        _assert("H: orient exits 0", r_orient.returncode == 0, r_orient.stderr.strip())
+        _assert("H: orient shows qualified_name",
+            "greet.hello" in r_orient.stdout, r_orient.stdout.strip())
+        _assert("H: orient shows file_path",
+            "greet.py" in r_orient.stdout, r_orient.stdout.strip())
+        _assert("H: orient shows start_line",
+            ":1-" in r_orient.stdout, r_orient.stdout.strip())
+        _assert("H: orient shows language",
+            "python" in r_orient.stdout, r_orient.stdout.strip())
+        _assert("H: orient shows detection method",
+            "python_ast" in r_orient.stdout, r_orient.stdout.strip())
+
+        # drifts — immediately after a fresh scan every entity is 'added'
+        r_drifts = run_ci(["drifts"], tmp)
+        _assert("H: drifts exits 0", r_drifts.returncode == 0, r_drifts.stderr.strip())
+        _assert("H: drifts shows open drift events",
+            "added" in r_drifts.stdout or "Open drifts" in r_drifts.stdout,
+            r_drifts.stdout.strip())
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -527,6 +577,7 @@ def main() -> None:
     test_syntax_error_behaviour()
     test_removed_and_restored()
     test_sql_qnames()
+    test_new_commands()
 
     total  = len(_results)
     passed = sum(1 for _, ok, _ in _results if ok)
