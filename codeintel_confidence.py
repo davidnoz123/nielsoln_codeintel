@@ -600,6 +600,48 @@ def test_published_command_registry() -> None:
                 {"scan", "status", "orient", "drifts"}.issubset(names),
                 sorted(names))
 
+            # summary derived from docstrings
+            scan_entry = next((e for e in parsed if e.get("command") == "scan"), None)
+            _assert("I: help-json scan entry has non-empty summary",
+                scan_entry is not None and bool(scan_entry.get("summary")),
+                str(scan_entry))
+
+            # long_description field present (may be empty string for simple commands)
+            _assert("I: help-json scan entry has long_description field",
+                scan_entry is not None and "long_description" in scan_entry,
+                str(scan_entry))
+
+            # help-json entry includes help_json alias
+            help_entry = next((e for e in parsed if e.get("command") == "help-json"), None)
+            _assert("I: help-json entry exists for help-json command",
+                help_entry is not None,
+                str([e.get("command") for e in parsed]))
+            if help_entry is not None:
+                aliases = help_entry.get("aliases", [])
+                _assert("I: help-json entry includes help_json alias",
+                    "help_json" in aliases,
+                    str(aliases))
+
+            # help-json long_description present
+            _assert("I: help-json entry has long_description field",
+                help_entry is not None and "long_description" in (help_entry or {}),
+                str(help_entry))
+
+        # runpy compatibility: module-level code must not blow up
+        runpy_script = textwrap.dedent(f"""\
+            import runpy, sys
+            sys.argv = ['codeintel.py']
+            runpy.run_path({CODEINTEL_PY!r}, run_name='__main__')
+        """)
+        r_runpy = subprocess.run(
+            [PYTHON, "-c", runpy_script],
+            cwd=str(tmp),
+            capture_output=True,
+            text=True,
+        )
+        _assert("I: runpy compatibility (no-args exits 0)",
+            r_runpy.returncode == 0, r_runpy.stderr.strip())
+
         # Existing commands still work via the registry.
         r_status = run_ci(["status"], tmp)
         _assert("I: status still works", r_status.returncode == 0, r_status.stderr.strip())

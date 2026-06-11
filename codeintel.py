@@ -1789,13 +1789,24 @@ def _annotation_name(annotation: object) -> str:
     return str(annotation).replace("typing.", "")
 
 
-def _first_doc_line(func: Callable) -> str:
+def _parse_docstring(func: Callable) -> Tuple[str, str]:
+    """Return (summary, long_description) from a function's docstring."""
     doc = inspect.getdoc(func) or ""
-    for line in doc.splitlines():
-        stripped = line.strip()
-        if stripped:
-            return stripped
-    return ""
+    lines = doc.splitlines()
+    summary = ""
+    summary_idx = -1
+    for i, line in enumerate(lines):
+        if line.strip():
+            summary = line.strip()
+            summary_idx = i
+            break
+    if summary_idx < 0:
+        return "", ""
+    remaining = lines[summary_idx + 1:]
+    while remaining and not remaining[0].strip():
+        remaining.pop(0)
+    long_description = "\n".join(remaining).strip()
+    return summary, long_description
 
 
 class _CommandSpec:
@@ -1806,12 +1817,11 @@ class _CommandSpec:
         name: str,
         func: Callable,
         aliases: Tuple[str, ...] = (),
-        summary: Optional[str] = None,
     ) -> None:
         self.name = name
         self.func = func
         self.aliases = aliases
-        self.summary = summary or _first_doc_line(func)
+        self.summary, self.long_description = _parse_docstring(func)
         self.params = [
             p
             for p in inspect.signature(func).parameters.values()
@@ -1840,6 +1850,7 @@ class _CommandSpec:
             "aliases": list(self.aliases),
             "parameters": parameters,
             "summary": self.summary,
+            "long_description": self.long_description,
         }
 
 
@@ -1857,25 +1868,22 @@ class PublishedCommandRegistry:
         self._specs: Dict[str, _CommandSpec] = {}
         self._aliases: Dict[str, str] = {}
 
-    def register(
-        self,
-        name: str,
-        func: Callable,
-        *,
-        aliases: Optional[List[str]] = None,
-        summary: Optional[str] = None,
-    ) -> Callable:
-        all_aliases = list(aliases or [])
-        # Auto-generate dash/underscore aliases.
-        if "_" in name and name.replace("_", "-") not in all_aliases:
-            all_aliases.append(name.replace("_", "-"))
-        if "-" in name and name.replace("-", "_") not in all_aliases:
-            all_aliases.append(name.replace("-", "_"))
-
-        spec = _CommandSpec(name, func, tuple(all_aliases), summary)
-        self._specs[name] = spec
-        for alias in spec.aliases:
-            self._aliases[alias] = name
+    def register(self, func: Callable) -> Callable:
+        """Register a command, deriving name and aliases from func.__name__."""
+        raw = func.__name__
+        if raw.startswith("cmd_"):
+            raw = raw[4:]
+        canonical = raw.replace("_", "-")
+        # Idempotent: skip if already registered.
+        if canonical in self._specs:
+            return func
+        aliases: List[str] = []
+        if canonical != raw:  # underscores became dashes → add underscore alias
+            aliases.append(raw)
+        spec = _CommandSpec(canonical, func, tuple(aliases))
+        self._specs[canonical] = spec
+        for alias in aliases:
+            self._aliases[alias] = canonical
         return func
 
     def resolve(self, token: str) -> Optional[_CommandSpec]:
@@ -1935,7 +1943,7 @@ class PublishedCommandRegistry:
         return 0
 
 
-REGISTRY = PublishedCommandRegistry()
+REGISTRY: Optional[PublishedCommandRegistry] = None
 
 
 # ---------------------------------------------------------------------------
@@ -1944,6 +1952,7 @@ REGISTRY = PublishedCommandRegistry()
 
 
 def cmd_scan(args: List[str]) -> None:
+    """Scan a file or directory tree."""
     if not args:
         print("Usage: codeintel.py scan <path>", file=sys.stderr)
         sys.exit(1)
@@ -1978,6 +1987,7 @@ def cmd_scan(args: List[str]) -> None:
 
 
 def cmd_map(args: List[str]) -> None:
+    """Show current entity map."""
     db = _open_db(require_existing=True)
     rows = db.query(
         "SELECT entity_type, qualified_name, file_path, start_line "
@@ -2002,6 +2012,7 @@ def cmd_map(args: List[str]) -> None:
 
 
 def cmd_find(args: List[str]) -> None:
+    """Find active entities by name (substring match)."""
     if not args:
         print("Usage: codeintel.py find <name>", file=sys.stderr)
         sys.exit(1)
@@ -2032,6 +2043,7 @@ def cmd_find(args: List[str]) -> None:
 
 
 def cmd_status(args: List[str]) -> None:
+    """Show DB health and scan statistics."""
     db = _open_db(require_existing=True)
 
     # Meta values
@@ -2106,7 +2118,9 @@ def cmd_status(args: List[str]) -> None:
 
 def cmd_orient(args: List[str]) -> None:
     """
-    Agent-facing entity lookup.  Prints rich orientation information for
+    Show rich orientation info for an entity (agent use).
+
+    Agent-facing entity lookup. Prints rich orientation information for
     each active entity whose qualified_name or name matches the search term.
     """
     if not args:
@@ -2165,6 +2179,7 @@ def cmd_orient(args: List[str]) -> None:
 
 
 def cmd_drifts(args: List[str]) -> None:
+    """List open drift events."""
     db = _open_db(require_existing=True)
     rows = db.query(
         "SELECT drift_event_id, scan_run_id, drift_kind, "
@@ -2198,6 +2213,8 @@ def cmd_drifts(args: List[str]) -> None:
 
 def cmd_stale(args: List[str]) -> None:
     """
+    List source files modified since last scan.
+
     Report source files whose on-disk sha256 no longer matches the stored
     file_hash, meaning they have been modified since the last scan.
     Paths are stored repo-relative and resolved against the repo root.
@@ -2241,31 +2258,32 @@ def cmd_help_json(args: List[str]) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 
-REGISTRY.register("scan", cmd_scan, summary="scan a file or directory tree")
-REGISTRY.register("map", cmd_map, summary="show current entity map")
-REGISTRY.register(
-    "find", cmd_find, summary="find active entities by name (substring match)"
+PUBLISHED_COMMANDS = (
+    cmd_scan,
+    cmd_map,
+    cmd_find,
+    cmd_stale,
+    cmd_status,
+    cmd_orient,
+    cmd_drifts,
+    cmd_commands,
+    cmd_help_json,
 )
-REGISTRY.register(
-    "stale", cmd_stale, summary="list source files modified since last scan"
-)
-REGISTRY.register("status", cmd_status, summary="show DB health and scan statistics")
-REGISTRY.register(
-    "orient", cmd_orient, summary="show rich orientation info for an entity (agent use)"
-)
-REGISTRY.register("drifts", cmd_drifts, summary="list open drift events")
-REGISTRY.register(
-    "commands", cmd_commands, summary="list published commands and descriptions"
-)
-REGISTRY.register(
-    "help-json", cmd_help_json, summary="print machine-readable command help as JSON"
-)
+
+
+def build_registry() -> PublishedCommandRegistry:
+    """Create and populate the command registry from PUBLISHED_COMMANDS."""
+    global REGISTRY
+    registry = PublishedCommandRegistry()
+    for func in PUBLISHED_COMMANDS:
+        registry.register(func)
+    REGISTRY = registry
+    return registry
 
 
 def main() -> None:
-    exit_code = REGISTRY.run(sys.argv[1:])
-    if exit_code:
-        sys.exit(exit_code)
+    registry = build_registry()
+    raise SystemExit(registry.run(sys.argv[1:]))
 
 
 if __name__ == "__main__":
