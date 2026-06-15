@@ -2132,11 +2132,54 @@ def cmd_orient(args: List[str]) -> None:
     escaped = _like_escape(name)
 
     rows = db.query(
-        "SELECT entity_id, qualified_name, entity_type, file_path, "
-        "       start_line, end_line, language, detection_method "
-        "FROM v_entity_current "
-        "WHERE qualified_name LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\' "
-        "ORDER BY file_path, start_line",
+        """
+        WITH
+        matching_entities AS (
+            SELECT
+                entity_id,
+                qualified_name,
+                name,
+                entity_type,
+                file_path,
+                start_line,
+                end_line,
+                language,
+                detection_method
+            FROM v_entity_current
+            WHERE qualified_name LIKE ? ESCAPE '\\'
+               OR name LIKE ? ESCAPE '\\'
+        ),
+        entity_text_pivot AS (
+            SELECT
+                entity_id,
+                MAX(CASE WHEN text_kind = 'signature'
+                         THEN text_body END) AS signature_text,
+                MAX(CASE WHEN text_kind = 'docstring'
+                         THEN text_body END) AS docstring_text
+            FROM entity_text
+            WHERE entity_id IN (
+                SELECT entity_id
+                FROM matching_entities
+            )
+            GROUP BY entity_id
+        )
+        SELECT
+            m.entity_id,
+            m.qualified_name,
+            m.name,
+            m.entity_type,
+            m.file_path,
+            m.start_line,
+            m.end_line,
+            m.language,
+            m.detection_method,
+            t.signature_text,
+            t.docstring_text
+        FROM matching_entities AS m
+        LEFT JOIN entity_text_pivot AS t
+          ON t.entity_id = m.entity_id
+        ORDER BY m.file_path, m.start_line
+        """,
         (f"%{escaped}%", f"%{escaped}%"),
     )
 
@@ -2154,23 +2197,11 @@ def cmd_orient(args: List[str]) -> None:
         print(f"  language  : {row['language'] or '-'}")
         print(f"  detection : {row['detection_method'] or '-'}")
 
-        # Signature text
-        sig = db.query(
-            "SELECT text_body FROM entity_text "
-            "WHERE entity_id = ? AND text_kind = 'signature'",
-            (row["entity_id"],),
-        )
-        if sig:
-            print(f"  signature : {sig[0]['text_body']}")
+        if row["signature_text"]:
+            print(f"  signature : {row['signature_text']}")
 
-        # Docstring — first paragraph only
-        doc = db.query(
-            "SELECT text_body FROM entity_text "
-            "WHERE entity_id = ? AND text_kind = 'docstring'",
-            (row["entity_id"],),
-        )
-        if doc:
-            first_para = doc[0]["text_body"].split("\n\n")[0].strip()
+        if row["docstring_text"]:
+            first_para = row["docstring_text"].split("\n\n")[0].strip()
             print(f"  docstring : {first_para}")
 
         print()
