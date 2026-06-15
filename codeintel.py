@@ -405,7 +405,9 @@ class SchemaMigrator:
         self._ensure_ledger()
         specs = self._read_tsv(tsv_path)
         self._register_and_validate(specs)
+        self._conn.commit()
         self._apply_pending()
+        self._conn.commit()
 
     def _ensure_ledger(self) -> None:
         self._conn.execute(
@@ -585,6 +587,7 @@ class SchemaMigrator:
                 "WHERE key = ?",
                 (str(exc), spec.key),
             )
+            self._conn.commit()
             raise MigrationError(f"failed migration {spec.key}: {exc}") from exc
 
     def _apply_add_column(self, table_name: str, payload: str) -> None:
@@ -880,7 +883,7 @@ class CodeIndexDb:
             ),
             (
                 "text_kind:source_snippet",
-                "Not used in v1.1.1.  Reserved for future full-body "
+                "Not currently used.  Reserved for future full-body "
                 "Python source capture.",
             ),
             # hash_kind values

@@ -1,0 +1,5 @@
+key	version	sequence	operation	object_name	payload	notes
+20260616_001_drift_acknowledged_at	1.1.2	10	add_column	drift_event	acknowledged_at TEXT	When the drift was acknowledged
+20260616_002_drift_acknowledged_by	1.1.2	20	add_column	drift_event	acknowledged_by TEXT	Who acknowledged the drift
+20260616_003_drift_acknowledgement_note	1.1.2	30	add_column	drift_event	acknowledgement_note TEXT	Optional acknowledgement note
+20260616_004_drift_resolution_kind	1.1.2	40	add_column	drift_event	resolution_kind TEXT	Resolution classification
