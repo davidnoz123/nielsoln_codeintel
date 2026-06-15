@@ -1940,20 +1940,33 @@ class PublishedCommandRegistry:
     def _bind(
         self, spec: _CommandSpec, rest: List[str]
     ) -> Dict[str, object]:
-        """Bind argv tokens to the function's named parameters."""
+        """Bind argv tokens to the function's named parameters.
+
+        POSITIONAL_ONLY and POSITIONAL_OR_KEYWORD params may consume
+        positional CLI tokens (in signature order) or be supplied as
+        --name value.  KEYWORD_ONLY params (defined after * in the
+        signature) must be supplied as --name value; they never consume
+        a bare positional token.
+        """
         positional, kwargs = self._parse_argv(rest)
         bound: Dict[str, object] = {}
         pos_idx = 0
         for p in spec.params:
+            is_kw_only = p.kind is inspect.Parameter.KEYWORD_ONLY
             if p.name in kwargs:
                 bound[p.name] = _convert_value(kwargs[p.name], p.annotation)
-            elif pos_idx < len(positional):
+            elif not is_kw_only and pos_idx < len(positional):
+                # Positional-or-keyword: consume the next bare token.
                 bound[p.name] = _convert_value(
                     positional[pos_idx], p.annotation
                 )
                 pos_idx += 1
             elif p.default is not inspect.Parameter.empty:
                 bound[p.name] = p.default
+            elif is_kw_only:
+                raise CommandError(
+                    f"missing required keyword argument: --{p.name}"
+                )
             else:
                 raise CommandError(f"missing required argument: {p.name}")
 
