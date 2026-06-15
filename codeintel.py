@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-codeintel.py — Code Intelligence DB v1.1.1
+codeintel.py — Code Intelligence DB v1.1.2
 
 Single-file, standard-library-only implementation.
 
@@ -36,7 +36,7 @@ SCANNER_VERSION = "codeintel 1.1.2"
 DEFAULT_DB_PATH = Path(".codeintel") / "codeintel.sqlite"
 
 # ---------------------------------------------------------------------------
-# Embedded schema — v1.1.1
+# Embedded schema — v1.1.2
 # Note: entity_location.detection_method has NO DEFAULT.
 # Every extractor must supply the value explicitly.
 # ---------------------------------------------------------------------------
@@ -294,6 +294,18 @@ _SQL_CONSTRAINT_STARTERS = frozenset(
 )
 
 # ---------------------------------------------------------------------------
+# SQL identifier validation — used by SchemaMigrator
+# ---------------------------------------------------------------------------
+
+_SQL_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _validate_sql_identifier(name: str, label: str) -> None:
+    """Raise MigrationError if name is not a simple SQLite identifier."""
+    if not _SQL_IDENTIFIER_RE.match(name):
+        raise MigrationError(f"invalid {label}: {name!r}")
+
+# ---------------------------------------------------------------------------
 # Utility helpers
 # ---------------------------------------------------------------------------
 
@@ -392,7 +404,7 @@ class SchemaMigrator:
     def migrate(self, tsv_path: Path) -> None:
         self._ensure_ledger()
         specs = self._read_tsv(tsv_path)
-        self._register_unseen(specs)
+        self._register_and_validate(specs)
         self._apply_pending()
 
     def _ensure_ledger(self) -> None:
@@ -497,10 +509,23 @@ class SchemaMigrator:
         )
         return hashlib.sha256(joined.encode("utf-8")).hexdigest()
 
-    def _register_unseen(self, specs: List[MigrationSpec]) -> None:
+    def _register_and_validate(self, specs: List[MigrationSpec]) -> None:
+        """Register unseen migrations as pending; raise MigrationError on checksum mismatch."""
         for spec in specs:
+            existing = self._conn.execute(
+                "SELECT checksum FROM schema_migration WHERE key = ?",
+                (spec.key,),
+            ).fetchone()
+            if existing is not None:
+                if existing["checksum"] != spec.checksum:
+                    raise MigrationError(
+                        f"migration {spec.key!r} checksum mismatch; "
+                        "registered migrations must not be edited"
+                    )
+                # Checksum matches — already registered, nothing to do.
+                continue
             self._conn.execute(
-                "INSERT OR IGNORE INTO schema_migration"
+                "INSERT INTO schema_migration"
                 "(key, version, sequence, operation, object_name, payload, notes, checksum, status) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')",
                 (
@@ -516,6 +541,10 @@ class SchemaMigrator:
             )
 
     def _apply_pending(self) -> None:
+        # Only pending rows are applied.  Failed rows are NOT retried automatically.
+        # To retry a failed migration, inspect the error_text column in schema_migration,
+        # fix the underlying problem, then manually reset the row's status to 'pending',
+        # or create a new corrective migration with a different key.
         rows = self._conn.execute(
             "SELECT key, version, sequence, operation, object_name, payload, notes, checksum "
             "FROM schema_migration "
@@ -559,9 +588,12 @@ class SchemaMigrator:
             raise MigrationError(f"failed migration {spec.key}: {exc}") from exc
 
     def _apply_add_column(self, table_name: str, payload: str) -> None:
-        col_name = payload.strip().split()[0] if payload.strip() else ""
-        if not col_name:
+        _validate_sql_identifier(table_name, "table name")
+        stripped_payload = payload.strip()
+        if not stripped_payload:
             raise MigrationError("add_column payload is empty")
+        col_name = stripped_payload.split()[0]
+        _validate_sql_identifier(col_name, "column name")
 
         existing = self._conn.execute(
             f"PRAGMA table_info({table_name})"
