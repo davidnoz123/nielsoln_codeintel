@@ -14,6 +14,7 @@ DB path: .codeintel/codeintel.sqlite  (relative to cwd)
 """
 
 import ast
+import csv
 import datetime
 import hashlib
 import inspect
@@ -22,6 +23,7 @@ import re
 import sqlite3
 import sys
 import typing
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -29,8 +31,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 # Version constants
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = "1.1.1"
-SCANNER_VERSION = "codeintel 1.1.1"
+SCHEMA_VERSION = "1.1.2"
+SCANNER_VERSION = "codeintel 1.1.2"
 DEFAULT_DB_PATH = Path(".codeintel") / "codeintel.sqlite"
 
 # ---------------------------------------------------------------------------
@@ -186,7 +188,11 @@ CREATE TABLE IF NOT EXISTS drift_event (
     status      TEXT NOT NULL DEFAULT 'open'
         CHECK (status IN ('open', 'acknowledged', 'ignored')),
     old_hash    TEXT,
-    new_hash    TEXT
+    new_hash    TEXT,
+    acknowledged_at TEXT,
+    acknowledged_by TEXT,
+    acknowledgement_note TEXT,
+    resolution_kind TEXT
 );
 
 -- ---------------------------------------------------------------------------
@@ -360,6 +366,215 @@ def _is_column_def(line: str) -> Optional[str]:
     return m.group(1)
 
 
+@dataclass(frozen=True)
+class MigrationSpec:
+    key: str
+    version: str
+    sequence: int
+    operation: str
+    object_name: str
+    payload: str
+    notes: str = ""
+    checksum: str = ""
+
+
+class MigrationError(Exception):
+    """Raised when schema migration parsing or application fails."""
+
+
+class SchemaMigrator:
+    """Small TSV-driven SQLite schema migrator."""
+
+    def __init__(self, conn: sqlite3.Connection, applied_by: str = "") -> None:
+        self._conn = conn
+        self._applied_by = applied_by
+
+    def migrate(self, tsv_path: Path) -> None:
+        self._ensure_ledger()
+        specs = self._read_tsv(tsv_path)
+        self._register_unseen(specs)
+        self._apply_pending()
+
+    def _ensure_ledger(self) -> None:
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS schema_migration (
+                key             TEXT PRIMARY KEY,
+                version         TEXT NOT NULL,
+                sequence        INTEGER NOT NULL,
+                operation       TEXT NOT NULL,
+                object_name     TEXT NOT NULL DEFAULT '',
+                payload         TEXT NOT NULL,
+                notes           TEXT NOT NULL DEFAULT '',
+                checksum        TEXT NOT NULL,
+                status          TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'applied', 'failed')),
+                applied_at      TEXT,
+                applied_by      TEXT,
+                error_text      TEXT
+            );
+            """
+        )
+
+    def _read_tsv(self, tsv_path: Path) -> List[MigrationSpec]:
+        try:
+            with tsv_path.open("r", encoding="utf-8", newline="") as fh:
+                reader = csv.DictReader(fh, delimiter="\t")
+                required = {
+                    "key",
+                    "version",
+                    "sequence",
+                    "operation",
+                    "object_name",
+                    "payload",
+                    "notes",
+                }
+                if reader.fieldnames is None or not required.issubset(reader.fieldnames):
+                    raise MigrationError("migration TSV header is missing required columns")
+
+                specs: List[MigrationSpec] = []
+                for row in reader:
+                    if not row:
+                        continue
+                    key = (row.get("key") or "").strip()
+                    version = (row.get("version") or "").strip()
+                    operation = (row.get("operation") or "").strip()
+                    object_name = (row.get("object_name") or "").strip()
+                    payload = (row.get("payload") or "").strip()
+                    notes = (row.get("notes") or "").strip()
+                    if not key or not version or not operation or not payload:
+                        raise MigrationError(f"invalid migration row: {row}")
+                    try:
+                        sequence = int((row.get("sequence") or "").strip())
+                    except ValueError as exc:
+                        raise MigrationError(f"invalid sequence for migration {key!r}") from exc
+                    checksum = self._checksum_for(
+                        key=key,
+                        version=version,
+                        sequence=sequence,
+                        operation=operation,
+                        object_name=object_name,
+                        payload=payload,
+                        notes=notes,
+                    )
+                    specs.append(
+                        MigrationSpec(
+                            key=key,
+                            version=version,
+                            sequence=sequence,
+                            operation=operation,
+                            object_name=object_name,
+                            payload=payload,
+                            notes=notes,
+                            checksum=checksum,
+                        )
+                    )
+                return sorted(specs, key=lambda s: (s.sequence, s.key))
+        except OSError as exc:
+            raise MigrationError(f"failed to read migration TSV: {tsv_path}") from exc
+
+    @staticmethod
+    def _checksum_for(
+        *,
+        key: str,
+        version: str,
+        sequence: int,
+        operation: str,
+        object_name: str,
+        payload: str,
+        notes: str,
+    ) -> str:
+        joined = "|".join(
+            [
+                key,
+                version,
+                str(sequence),
+                operation,
+                object_name,
+                payload,
+                notes,
+            ]
+        )
+        return hashlib.sha256(joined.encode("utf-8")).hexdigest()
+
+    def _register_unseen(self, specs: List[MigrationSpec]) -> None:
+        for spec in specs:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO schema_migration"
+                "(key, version, sequence, operation, object_name, payload, notes, checksum, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')",
+                (
+                    spec.key,
+                    spec.version,
+                    spec.sequence,
+                    spec.operation,
+                    spec.object_name,
+                    spec.payload,
+                    spec.notes,
+                    spec.checksum,
+                ),
+            )
+
+    def _apply_pending(self) -> None:
+        rows = self._conn.execute(
+            "SELECT key, version, sequence, operation, object_name, payload, notes, checksum "
+            "FROM schema_migration "
+            "WHERE status = 'pending' "
+            "ORDER BY sequence ASC, key ASC"
+        ).fetchall()
+        for row in rows:
+            spec = MigrationSpec(
+                key=row["key"],
+                version=row["version"],
+                sequence=row["sequence"],
+                operation=row["operation"],
+                object_name=row["object_name"],
+                payload=row["payload"],
+                notes=row["notes"],
+                checksum=row["checksum"],
+            )
+            self._apply_one(spec)
+
+    def _apply_one(self, spec: MigrationSpec) -> None:
+        try:
+            if spec.operation == "add_column":
+                self._apply_add_column(spec.object_name, spec.payload)
+            elif spec.operation == "exec_sql":
+                self._conn.executescript(spec.payload)
+            else:
+                raise MigrationError(f"unsupported migration operation: {spec.operation}")
+            self._conn.execute(
+                "UPDATE schema_migration "
+                "SET status = 'applied', applied_at = ?, applied_by = ?, error_text = NULL "
+                "WHERE key = ?",
+                (_utcnow(), self._applied_by, spec.key),
+            )
+        except Exception as exc:
+            self._conn.execute(
+                "UPDATE schema_migration "
+                "SET status = 'failed', error_text = ? "
+                "WHERE key = ?",
+                (str(exc), spec.key),
+            )
+            raise MigrationError(f"failed migration {spec.key}: {exc}") from exc
+
+    def _apply_add_column(self, table_name: str, payload: str) -> None:
+        col_name = payload.strip().split()[0] if payload.strip() else ""
+        if not col_name:
+            raise MigrationError("add_column payload is empty")
+
+        existing = self._conn.execute(
+            f"PRAGMA table_info({table_name})"
+        ).fetchall()
+        existing_cols = {row["name"] for row in existing}
+        if col_name in existing_cols:
+            return
+
+        self._conn.execute(
+            f"ALTER TABLE {table_name} ADD COLUMN {payload}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Directory traversal
 # ---------------------------------------------------------------------------
@@ -517,6 +732,7 @@ class CodeIndexDb:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._apply_schema()
+        self._migrate_schema()
         self._seed()
 
     # ------------------------------------------------------------------
@@ -526,6 +742,13 @@ class CodeIndexDb:
         # executescript issues an implicit COMMIT before running, which is
         # fine here — we only apply DDL during init.
         self._conn.executescript(SCHEMA_SQL)
+
+    def _migrate_schema(self) -> None:
+        tsv_path = Path(__file__).resolve().with_name("codeintel_migrations.tsv")
+        if not tsv_path.exists():
+            return
+        migrator = SchemaMigrator(self._conn, applied_by=SCANNER_VERSION)
+        migrator.migrate(tsv_path)
 
     # ------------------------------------------------------------------
     # Seed: meta rows + design-decision vocabulary
@@ -544,7 +767,8 @@ class CodeIndexDb:
         ]
         for key, value in rows:
             self._conn.execute(
-                "INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)",
+                "INSERT INTO meta(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (key, value),
             )
 
@@ -1018,6 +1242,30 @@ class CodeIndexDb:
             "(entity_id, scan_run_id, drift_kind, status, old_hash, new_hash) "
             "VALUES (?, ?, ?, 'open', ?, ?)",
             (entity_id, scan_run_id, drift_kind, old_hash, new_hash),
+        )
+
+    def drift_event_exists(self, drift_event_id: int) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM drift_event WHERE id = ?",
+            (drift_event_id,),
+        ).fetchone()
+        return row is not None
+
+    def update_drift_resolution(
+        self,
+        drift_event_id: int,
+        *,
+        status: str,
+        by: str,
+        note: str,
+        resolution_kind: str,
+    ) -> None:
+        self._conn.execute(
+            "UPDATE drift_event "
+            "SET status = ?, acknowledged_at = ?, acknowledged_by = ?, "
+            "    acknowledgement_note = ?, resolution_kind = ? "
+            "WHERE id = ?",
+            (status, _utcnow(), by, note, resolution_kind, drift_event_id),
         )
 
     # ------------------------------------------------------------------
@@ -2023,6 +2271,13 @@ class PublishedCommandRegistry:
 REGISTRY: Optional[PublishedCommandRegistry] = None
 
 
+def _registry() -> PublishedCommandRegistry:
+    global REGISTRY
+    if REGISTRY is None:
+        REGISTRY = PublishedCommandRegistry.from_mapping(PUBLISHED_COMMANDS)
+    return REGISTRY
+
+
 # ---------------------------------------------------------------------------
 # Published commands
 # ---------------------------------------------------------------------------
@@ -2270,22 +2525,62 @@ def orient(name: str) -> str:
     return "\n\n".join(parts)
 
 
-def drifts() -> str:
-    """List open drift events."""
+def drifts(scope: str = "open") -> str:
+    """List drift events by scope: open, latest, or all."""
     db = _open_db(require_existing=True)
-    rows = db.query(
-        "SELECT drift_event_id, scan_run_id, drift_kind, "
-        "       qualified_name, entity_type, file_path, start_line, "
-        "       old_hash, new_hash, status "
-        "FROM v_open_drifts "
-        "ORDER BY drift_event_id"
-    )
+
+    scope_norm = scope.strip().lower()
+    if scope_norm == "open":
+        rows = db.query(
+            "SELECT drift_event_id, scan_run_id, drift_kind, "
+            "       qualified_name, entity_type, file_path, start_line, "
+            "       old_hash, new_hash, status "
+            "FROM v_open_drifts "
+            "ORDER BY drift_event_id"
+        )
+    elif scope_norm in ("latest", "all"):
+        latest_scan_run_id: Optional[int] = None
+        if scope_norm == "latest":
+            latest = db.query("SELECT id FROM scan_run ORDER BY id DESC LIMIT 1")
+            latest_scan_run_id = latest[0]["id"] if latest else None
+            if latest_scan_run_id is None:
+                db.close()
+                return "No scan runs found."
+
+        sql = (
+            "SELECT de.id AS drift_event_id, de.scan_run_id, de.drift_kind, "
+            "       e.qualified_name, e.entity_type, sf.file_path, el.start_line, "
+            "       de.old_hash, de.new_hash, de.status "
+            "FROM drift_event de "
+            "JOIN code_entity e ON e.id = de.entity_id "
+            "LEFT JOIN entity_location el "
+            "  ON el.id = ("
+            "      SELECT el2.id FROM entity_location el2 "
+            "      WHERE el2.entity_id = e.id "
+            "      ORDER BY el2.scan_run_id DESC, el2.id DESC "
+            "      LIMIT 1"
+            "  ) "
+            "LEFT JOIN source_file sf ON sf.id = el.source_file_id "
+        )
+        params: Tuple[object, ...] = ()
+        if latest_scan_run_id is not None:
+            sql += "WHERE de.scan_run_id = ? "
+            params = (latest_scan_run_id,)
+        sql += "ORDER BY de.id"
+        rows = db.query(sql, params)
+    else:
+        db.close()
+        raise CommandError("scope must be one of: open, latest, all")
+
     db.close()
 
     if not rows:
-        return "No open drift events."
+        if scope_norm == "open":
+            return "No open drift events."
+        return f"No drift events for scope '{scope_norm}'."
 
-    out: List[str] = [f"Open drifts ({len(rows)}):"]
+    label = "Open drifts" if scope_norm == "open" else f"Drifts ({scope_norm})"
+    out: List[str] = [f"{label} ({len(rows)}):"]
     for row in rows:
         fp = row["file_path"] or ""
         loc = (
@@ -2304,6 +2599,51 @@ def drifts() -> str:
         )
 
     return "\n".join(out)
+
+
+def ack_drift(
+    drift_event_id: int,
+    by: str = "human",
+    note: str = "",
+    resolution: str = "acknowledged",
+) -> str:
+    """Acknowledge a drift event and record acknowledgement metadata."""
+    db = _open_db(require_existing=True)
+    if not db.drift_event_exists(drift_event_id):
+        db.close()
+        raise CommandError(f"drift event id not found: {drift_event_id}")
+    db.update_drift_resolution(
+        drift_event_id,
+        status="acknowledged",
+        by=by,
+        note=note,
+        resolution_kind=resolution,
+    )
+    db.commit()
+    db.close()
+    return f"Acknowledged drift id={drift_event_id}."
+
+
+def ignore_drift(
+    drift_event_id: int,
+    by: str = "human",
+    note: str = "",
+) -> str:
+    """Mark a drift event as ignored with acknowledgement metadata."""
+    db = _open_db(require_existing=True)
+    if not db.drift_event_exists(drift_event_id):
+        db.close()
+        raise CommandError(f"drift event id not found: {drift_event_id}")
+    db.update_drift_resolution(
+        drift_event_id,
+        status="ignored",
+        by=by,
+        note=note,
+        resolution_kind="ignored",
+    )
+    db.commit()
+    db.close()
+    return f"Ignored drift id={drift_event_id}."
 
 
 def stale() -> str:
@@ -2339,7 +2679,7 @@ def stale() -> str:
 def commands() -> str:
     """List published commands and one-line descriptions."""
     out: List[str] = ["Available commands:"]
-    for spec in REGISTRY.specs():
+    for spec in _registry().specs():
         alias_hint = (
             f"  (alias: {', '.join(spec.aliases)})" if spec.aliases else ""
         )
@@ -2349,7 +2689,7 @@ def commands() -> str:
 
 def help_json() -> str:
     """Emit command registry metadata as JSON."""
-    payload = [spec.describe() for spec in REGISTRY.specs()]
+    payload = [spec.describe() for spec in _registry().specs()]
     return json.dumps(payload, indent=2, default=str)
 
 
@@ -2838,6 +3178,10 @@ PUBLISHED_COMMANDS: Dict[str, Callable] = {
     "status":           status,
     "stale":            stale,
     "drifts":           drifts,
+    "ack-drift":        ack_drift,
+    "ack_drift":        ack_drift,
+    "ignore-drift":     ignore_drift,
+    "ignore_drift":     ignore_drift,
     "commands":         commands,
     "help-json":        help_json,
     "help_json":        help_json,
@@ -2855,15 +3199,13 @@ PUBLISHED_COMMANDS: Dict[str, Callable] = {
 
 def build_registry() -> PublishedCommandRegistry:
     """Create and populate the command registry from PUBLISHED_COMMANDS."""
-    global REGISTRY
-    REGISTRY = PublishedCommandRegistry.from_mapping(PUBLISHED_COMMANDS)
-    return REGISTRY
+    return _registry()
 
 
-def main() -> None:
+def main(argv: Optional[List[str]] = None) -> int:
     registry = build_registry()
-    raise SystemExit(registry.run(sys.argv[1:]))
+    return registry.run(sys.argv[1:] if argv is None else argv)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
