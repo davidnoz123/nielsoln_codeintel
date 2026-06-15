@@ -1663,30 +1663,28 @@ class CodeScanner:
 def _open_db(require_existing: bool = False) -> CodeIndexDb:
     db_path = DEFAULT_DB_PATH
     if require_existing and not db_path.exists():
-        print(
-            "Error: no database found.  Run:  python codeintel.py scan <path>",
-            file=sys.stderr,
+        raise CommandError(
+            "no database found.  Run:  python codeintel.py scan <path>"
         )
-        sys.exit(1)
     return CodeIndexDb(db_path)
 
 
 # ---------------------------------------------------------------------------
 # Published command registry
 #
-# A small, reusable command-publishing pattern.  It is deliberately
-# standard-library-only and free of argparse, so it can be lifted into other
-# repositories unchanged.  Commands are plain callables; their command-line
-# interface is derived by introspecting the callable's signature.
+# Published commands are ordinary named-argument callables.  CLI, MCP, chat,
+# and REPL are all transports/adapters over the same callable.
 #
-# Conversion rules (no eval is ever used):
-#   * A single parameter annotated ``List[str]`` receives all remaining
-#     command-line arguments as a list of strings (variadic style).  This is
-#     the convention used by the built-in CodeIntel commands.
-#   * str / int / float / bool parameters convert one positional argument each.
-#   * list / dict parameters are parsed with json.loads (and validated).
-#   * Optional[str|int|float|bool] accepts the literals "none"/"null" (and the
-#     empty string) as None, otherwise converts as the inner scalar type.
+# The registry is built from an explicit PUBLISHED_COMMANDS mapping; the first
+# key for each unique callable becomes the canonical command name, and any
+# subsequent keys for the same callable are registered as aliases.
+#
+# CLI parsing rules (no eval is used):
+#   str / int / float / bool  — one positional token each
+#   list / dict               — parsed with json.loads
+#   Optional[X]               — "none"/"null"/"" → None, else converts as X
+#   --name value              — keyword override for any parameter
+#   --flag                    — bare flag treated as boolean true
 # ---------------------------------------------------------------------------
 
 _NONE_TYPE = type(None)
@@ -1703,11 +1701,6 @@ def _parse_bool(raw: str) -> bool:
     if low in ("0", "false", "no", "n", "off"):
         return False
     raise CommandError(f"invalid boolean value: {raw!r}")
-
-
-def _is_str_list(annotation: object) -> bool:
-    """True only for the variadic ``List[str]`` convention."""
-    return typing.get_origin(annotation) is list and typing.get_args(annotation) == (str,)
 
 
 def _convert_scalar(raw: str, scalar_type: object) -> object:
@@ -1829,6 +1822,7 @@ class _CommandSpec:
             in (
                 inspect.Parameter.POSITIONAL_ONLY,
                 inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
             )
         ]
 
@@ -1840,9 +1834,9 @@ class _CommandSpec:
                 {
                     "name": p.name,
                     "type": _annotation_name(p.annotation),
-                    "required": not has_default and not _is_str_list(p.annotation),
+                    "required": not has_default,
                     "default": p.default if has_default else None,
-                    "variadic": _is_str_list(p.annotation),
+                    "kind": p.kind.name.lower(),
                 }
             )
         return {
@@ -1857,34 +1851,55 @@ class _CommandSpec:
 class PublishedCommandRegistry:
     """
     Lightweight registry that publishes named commands and runs them from
-    ``sys.argv``-style argument lists.
+    sys.argv-style argument lists.
 
-    Names containing underscores are also reachable via their dash form (and
-    vice versa), so ``help_json`` and ``help-json`` resolve to the same
-    command.
+    Built from an explicit PUBLISHED_COMMANDS mapping; the first key for each
+    unique callable becomes the canonical command name, and subsequent keys
+    for the same callable are registered as aliases.
     """
 
     def __init__(self) -> None:
         self._specs: Dict[str, _CommandSpec] = {}
         self._aliases: Dict[str, str] = {}
 
-    def register(self, func: Callable) -> Callable:
-        """Register a command, deriving name and aliases from func.__name__."""
-        raw = func.__name__
-        if raw.startswith("cmd_"):
-            raw = raw[4:]
-        canonical = raw.replace("_", "-")
-        # Idempotent: skip if already registered.
-        if canonical in self._specs:
-            return func
-        aliases: List[str] = []
-        if canonical != raw:  # underscores became dashes → add underscore alias
-            aliases.append(raw)
-        spec = _CommandSpec(canonical, func, tuple(aliases))
-        self._specs[canonical] = spec
-        for alias in aliases:
-            self._aliases[alias] = canonical
-        return func
+    @classmethod
+    def from_mapping(
+        cls, mapping: Dict[str, Callable]
+    ) -> "PublishedCommandRegistry":
+        """
+        Build a registry from an explicit name→callable mapping.
+
+        The first key for each unique callable becomes the canonical command
+        name; subsequent keys for the same callable are registered as aliases.
+        """
+        registry = cls()
+
+        # First pass: collect canonical name and aliases per function.
+        func_to_canonical: Dict[int, str] = {}
+        func_to_aliases: Dict[int, List[str]] = {}
+        for name, func in mapping.items():
+            fid = id(func)
+            if fid not in func_to_canonical:
+                func_to_canonical[fid] = name
+                func_to_aliases[fid] = []
+            else:
+                func_to_aliases[fid].append(name)
+
+        # Second pass: register in first-occurrence order.
+        seen: set = set()
+        for name, func in mapping.items():
+            fid = id(func)
+            if fid in seen:
+                continue
+            seen.add(fid)
+            canonical = func_to_canonical[fid]
+            aliases = tuple(func_to_aliases[fid])
+            spec = _CommandSpec(canonical, func, aliases)
+            registry._specs[canonical] = spec
+            for alias in aliases:
+                registry._aliases[alias] = canonical
+
+        return registry
 
     def resolve(self, token: str) -> Optional[_CommandSpec]:
         if token in self._specs:
@@ -1893,27 +1908,65 @@ class PublishedCommandRegistry:
         return self._specs[canonical] if canonical is not None else None
 
     def names(self) -> List[str]:
-        return sorted(self._specs)
+        return list(self._specs)
 
     def specs(self) -> List[_CommandSpec]:
         return [self._specs[n] for n in self.names()]
 
-    def _bind(self, spec: _CommandSpec, rest: List[str]) -> List[object]:
-        values: List[object] = []
+    @staticmethod
+    def _parse_argv(
+        rest: List[str],
+    ) -> Tuple[List[str], Dict[str, str]]:
+        """Split argv into positional tokens and --key value kwargs."""
+        positional: List[str] = []
+        kwargs: Dict[str, str] = {}
         i = 0
-        for p in spec.params:
-            if _is_str_list(p.annotation):
-                values.append(list(rest[i:]))
-                i = len(rest)
-                continue
-            if i < len(rest):
-                values.append(_convert_value(rest[i], p.annotation))
+        while i < len(rest):
+            token = rest[i]
+            if token.startswith("--"):
+                key = token[2:]
+                if i + 1 < len(rest) and not rest[i + 1].startswith("--"):
+                    kwargs[key] = rest[i + 1]
+                    i += 2
+                else:
+                    # Bare --flag → boolean true
+                    kwargs[key] = "true"
+                    i += 1
+            else:
+                positional.append(token)
                 i += 1
+        return positional, kwargs
+
+    def _bind(
+        self, spec: _CommandSpec, rest: List[str]
+    ) -> Dict[str, object]:
+        """Bind argv tokens to the function's named parameters."""
+        positional, kwargs = self._parse_argv(rest)
+        bound: Dict[str, object] = {}
+        pos_idx = 0
+        for p in spec.params:
+            if p.name in kwargs:
+                bound[p.name] = _convert_value(kwargs[p.name], p.annotation)
+            elif pos_idx < len(positional):
+                bound[p.name] = _convert_value(
+                    positional[pos_idx], p.annotation
+                )
+                pos_idx += 1
             elif p.default is not inspect.Parameter.empty:
-                values.append(p.default)
+                bound[p.name] = p.default
             else:
                 raise CommandError(f"missing required argument: {p.name}")
-        return values
+
+        if pos_idx < len(positional):
+            extra = " ".join(positional[pos_idx:])
+            raise CommandError(f"unexpected extra argument(s): {extra}")
+
+        unknown_kwargs = set(kwargs) - {p.name for p in spec.params}
+        if unknown_kwargs:
+            names = ", ".join(sorted(unknown_kwargs))
+            raise CommandError(f"unknown option(s): {names}")
+                            
+        return bound
 
     def print_usage(self, unknown: Optional[str] = None) -> None:
         if unknown is not None:
@@ -1939,7 +1992,18 @@ class PublishedCommandRegistry:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
 
-        spec.func(*bound)
+        try:
+            result = spec.func(**bound)
+        except CommandError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+
+        if isinstance(result, str):
+            if result:
+                print(result)
+        elif isinstance(result, (dict, list)):
+            print(json.dumps(result, indent=2, default=str))
+        # None → print nothing
         return 0
 
 
@@ -1947,20 +2011,15 @@ REGISTRY: Optional[PublishedCommandRegistry] = None
 
 
 # ---------------------------------------------------------------------------
-# CLI commands
+# Published commands
 # ---------------------------------------------------------------------------
 
 
-def cmd_scan(args: List[str]) -> None:
+def scan(path: str) -> str:
     """Scan a file or directory tree."""
-    if not args:
-        print("Usage: codeintel.py scan <path>", file=sys.stderr)
-        sys.exit(1)
-
-    scan_path = Path(args[0]).resolve()
+    scan_path = Path(path).resolve()
     if not scan_path.exists():
-        print(f"Error: path does not exist: {scan_path}", file=sys.stderr)
-        sys.exit(1)
+        raise CommandError(f"path does not exist: {scan_path}")
 
     db = _open_db()
     repo_slug, root_path, branch_name = _get_repo_info(scan_path)
@@ -1975,18 +2034,18 @@ def cmd_scan(args: List[str]) -> None:
     scan_run_id, files_scanned, entities_observed, drifts_detected = scanner.scan(
         scan_path
     )
+    db.close()
 
-    print(
+    return (
         f"Scan complete  "
         f"run={scan_run_id}  "
         f"files={files_scanned}  "
         f"entities={entities_observed}  "
         f"drifts={drifts_detected}"
     )
-    db.close()
 
 
-def cmd_map(args: List[str]) -> None:
+def map_repo() -> str:
     """Show current entity map."""
     db = _open_db(require_existing=True)
     rows = db.query(
@@ -1994,30 +2053,26 @@ def cmd_map(args: List[str]) -> None:
         "FROM v_entity_current "
         "ORDER BY file_path, start_line, qualified_name"
     )
-    if not rows:
-        print("No active entities found.")
-        db.close()
-        return
+    db.close()
 
+    if not rows:
+        return "No active entities found."
+
+    out: List[str] = []
     current_file: object = object()  # sentinel — intentionally unequal to any str
     for row in rows:
         fp = row["file_path"] or "(no file)"
         if fp != current_file:
             current_file = fp
-            print(f"\n{fp}")
+            out.append(f"\n{fp}")
         line_tag = f":{row['start_line']}" if row["start_line"] is not None else ""
-        print(f"  [{row['entity_type']}] {row['qualified_name']}{line_tag}")
+        out.append(f"  [{row['entity_type']}] {row['qualified_name']}{line_tag}")
 
-    db.close()
+    return "\n".join(out)
 
 
-def cmd_find(args: List[str]) -> None:
+def find(name: str) -> str:
     """Find active entities by name (substring match)."""
-    if not args:
-        print("Usage: codeintel.py find <name>", file=sys.stderr)
-        sys.exit(1)
-
-    name = args[0]
     db = _open_db(require_existing=True)
     escaped = _like_escape(name)
     rows = db.query(
@@ -2027,26 +2082,24 @@ def cmd_find(args: List[str]) -> None:
         "ORDER BY file_path, start_line",
         (f"%{escaped}%", f"%{escaped}%"),
     )
-    if not rows:
-        print(f"No active entities matching '{name}'.")
-        db.close()
-        return
-
-    for row in rows:
-        fp = row["file_path"] or ""
-        loc = ""
-        if fp:
-            loc = f"  {fp}:{row['start_line']}-{row['end_line']}"
-        print(f"[{row['entity_type']}] {row['qualified_name']}{loc}")
-
     db.close()
 
+    if not rows:
+        return f"No active entities matching '{name}'."
 
-def cmd_status(args: List[str]) -> None:
+    out: List[str] = []
+    for row in rows:
+        fp = row["file_path"] or ""
+        loc = f"  {fp}:{row['start_line']}-{row['end_line']}" if fp else ""
+        out.append(f"[{row['entity_type']}] {row['qualified_name']}{loc}")
+
+    return "\n".join(out)
+
+
+def status() -> str:
     """Show DB health and scan statistics."""
     db = _open_db(require_existing=True)
 
-    # Meta values
     def _meta(key: str) -> str:
         rows = db.query("SELECT value FROM meta WHERE key = ?", (key,))
         return rows[0]["value"] if rows else "?"
@@ -2054,22 +2107,24 @@ def cmd_status(args: List[str]) -> None:
     schema_v  = _meta("schema_version")
     scanner_v = _meta("scanner_version")
 
-    print(f"DB path         : {db.db_path}")
-    print(f"schema_version  : {schema_v}")
-    print(f"scanner_version : {scanner_v}")
+    out: List[str] = [
+        f"DB path         : {db.db_path}",
+        f"schema_version  : {schema_v}",
+        f"scanner_version : {scanner_v}",
+    ]
 
-    # Repos and branches
     repo_rows = db.query(
         "SELECT gr.repo_slug, gr.root_path, gb.branch_name "
         "FROM git_branch gb "
         "JOIN git_repo gr ON gr.id = gb.repo_id "
         "ORDER BY gr.repo_slug, gb.branch_name"
     )
-    print(f"repos/branches  : {len(repo_rows)}")
+    out.append(f"repos/branches  : {len(repo_rows)}")
     for row in repo_rows:
-        print(f"  {row['repo_slug']} / {row['branch_name']}  ({row['root_path']})")
+        out.append(
+            f"  {row['repo_slug']} / {row['branch_name']}  ({row['root_path']})"
+        )
 
-    # Latest scan run
     latest = db.query(
         "SELECT id, status, started_at, finished_at, "
         "       files_scanned, entities_observed, drifts_detected "
@@ -2078,28 +2133,26 @@ def cmd_status(args: List[str]) -> None:
     )
     if latest:
         sr = latest[0]
-        print(
+        out.append(
             f"latest scan run : id={sr['id']}  status={sr['status']}  "
             f"started={sr['started_at']}  finished={sr['finished_at'] or '-'}  "
             f"files={sr['files_scanned']}  entities={sr['entities_observed']}  "
             f"drifts={sr['drifts_detected']}"
         )
     else:
-        print("latest scan run : none")
+        out.append("latest scan run : none")
 
-    # Counts
     active_entities = db.query(
         "SELECT COUNT(*) AS n FROM code_entity WHERE lifecycle_status = 'active'"
     )[0]["n"]
     source_files = db.query("SELECT COUNT(*) AS n FROM source_file")[0]["n"]
-    open_drifts  = db.query(
+    open_drifts = db.query(
         "SELECT COUNT(*) AS n FROM drift_event WHERE status = 'open'"
     )[0]["n"]
-    failed_runs  = db.query(
+    failed_runs = db.query(
         "SELECT COUNT(*) AS n FROM scan_run WHERE status = 'failed'"
     )[0]["n"]
 
-    # Stale count reuses the same logic as cmd_stale
     sf_rows = db.get_source_files_for_stale()
     stale_count = 0
     for row in sf_rows:
@@ -2107,27 +2160,25 @@ def cmd_status(args: List[str]) -> None:
         if not p.exists() or _hash_file(p) != row["file_hash"]:
             stale_count += 1
 
-    print(f"active entities : {active_entities}")
-    print(f"source files    : {source_files}")
-    print(f"stale files     : {stale_count}")
-    print(f"open drifts     : {open_drifts}")
-    print(f"failed runs     : {failed_runs}")
+    out.extend([
+        f"active entities : {active_entities}",
+        f"source files    : {source_files}",
+        f"stale files     : {stale_count}",
+        f"open drifts     : {open_drifts}",
+        f"failed runs     : {failed_runs}",
+    ])
 
     db.close()
+    return "\n".join(out)
 
 
-def cmd_orient(args: List[str]) -> None:
+def orient(name: str) -> str:
     """
     Show rich orientation info for an entity (agent use).
 
-    Agent-facing entity lookup. Prints rich orientation information for
-    each active entity whose qualified_name or name matches the search term.
+    Agent-facing entity lookup. Returns rich orientation information for each
+    active entity whose qualified_name or name matches the search term.
     """
-    if not args:
-        print("Usage: codeintel.py orient <name>", file=sys.stderr)
-        sys.exit(1)
-
-    name = args[0]
     db = _open_db(require_existing=True)
     escaped = _like_escape(name)
 
@@ -2182,34 +2233,31 @@ def cmd_orient(args: List[str]) -> None:
         """,
         (f"%{escaped}%", f"%{escaped}%"),
     )
+    db.close()
 
     if not rows:
-        print(f"No active entities matching '{name}'.")
-        db.close()
-        return
+        return f"No active entities matching '{name}'."
 
+    parts: List[str] = []
     for row in rows:
         fp = row["file_path"] or ""
         loc = f"{fp}:{row['start_line']}-{row['end_line']}" if fp else ""
-        print(f"[{row['entity_type']}] {row['qualified_name']}")
+        block: List[str] = [f"[{row['entity_type']}] {row['qualified_name']}"]
         if loc:
-            print(f"  location  : {loc}")
-        print(f"  language  : {row['language'] or '-'}")
-        print(f"  detection : {row['detection_method'] or '-'}")
-
+            block.append(f"  location  : {loc}")
+        block.append(f"  language  : {row['language'] or '-'}")
+        block.append(f"  detection : {row['detection_method'] or '-'}")
         if row["signature_text"]:
-            print(f"  signature : {row['signature_text']}")
-
+            block.append(f"  signature : {row['signature_text']}")
         if row["docstring_text"]:
             first_para = row["docstring_text"].split("\n\n")[0].strip()
-            print(f"  docstring : {first_para}")
+            block.append(f"  docstring : {first_para}")
+        parts.append("\n".join(block))
 
-        print()
-
-    db.close()
+    return "\n\n".join(parts)
 
 
-def cmd_drifts(args: List[str]) -> None:
+def drifts() -> str:
     """List open drift events."""
     db = _open_db(require_existing=True)
     rows = db.query(
@@ -2219,19 +2267,22 @@ def cmd_drifts(args: List[str]) -> None:
         "FROM v_open_drifts "
         "ORDER BY drift_event_id"
     )
+    db.close()
 
     if not rows:
-        print("No open drift events.")
-        db.close()
-        return
+        return "No open drift events."
 
-    print(f"Open drifts ({len(rows)}):")
+    out: List[str] = [f"Open drifts ({len(rows)}):"]
     for row in rows:
         fp = row["file_path"] or ""
-        loc = f"{fp}:{row['start_line']}" if fp and row["start_line"] is not None else fp
+        loc = (
+            f"{fp}:{row['start_line']}"
+            if fp and row["start_line"] is not None
+            else fp
+        )
         old_h = (row["old_hash"] or "")[:10] or "-"
         new_h = (row["new_hash"] or "")[:10] or "-"
-        print(
+        out.append(
             f"  [{row['drift_kind']:8}] id={row['drift_event_id']} "
             f"run={row['scan_run_id']} "
             f"{row['qualified_name']} ({row['entity_type']}) "
@@ -2239,10 +2290,10 @@ def cmd_drifts(args: List[str]) -> None:
             f"old={old_h} new={new_h}"
         )
 
-    db.close()
+    return "\n".join(out)
 
 
-def cmd_stale(args: List[str]) -> None:
+def stale() -> str:
     """
     List source files modified since last scan.
 
@@ -2252,64 +2303,72 @@ def cmd_stale(args: List[str]) -> None:
     """
     db = _open_db(require_existing=True)
     rows = db.get_source_files_for_stale()
+    db.close()
 
-    stale: List[Tuple[str, str]] = []
+    stale_files: List[Tuple[str, str]] = []
     for row in rows:
         p = Path(row["root_path"]) / row["file_path"]
         if not p.exists():
-            stale.append((row["file_path"], "missing"))
-        else:
-            if _hash_file(p) != row["file_hash"]:
-                stale.append((row["file_path"], "modified"))
+            stale_files.append((row["file_path"], "missing"))
+        elif _hash_file(p) != row["file_hash"]:
+            stale_files.append((row["file_path"], "modified"))
 
-    if not stale:
-        print("All scanned source files are current.")
-    else:
-        print(f"Stale ({len(stale)}):")
-        for file_path, reason in stale:
-            print(f"  [{reason}] {file_path}")
+    if not stale_files:
+        return "All scanned source files are current."
 
-    db.close()
+    out: List[str] = [f"Stale ({len(stale_files)}):"]
+    for file_path, reason in stale_files:
+        out.append(f"  [{reason}] {file_path}")
+
+    return "\n".join(out)
 
 
-def cmd_commands(args: List[str]) -> None:
+def commands() -> str:
     """List published commands and one-line descriptions."""
-    print("Available commands:")
+    out: List[str] = ["Available commands:"]
     for spec in REGISTRY.specs():
-        print(f"  {spec.name:<11} {spec.summary}")
+        alias_hint = (
+            f"  (alias: {', '.join(spec.aliases)})" if spec.aliases else ""
+        )
+        out.append(f"  {spec.name:<11} {spec.summary}{alias_hint}")
+    return "\n".join(out)
 
 
-def cmd_help_json(args: List[str]) -> None:
-    """Print machine-readable command help as JSON."""
+def help_json() -> str:
+    """Emit command registry metadata as JSON."""
     payload = [spec.describe() for spec in REGISTRY.specs()]
-    print(json.dumps(payload, indent=2, default=str))
+    return json.dumps(payload, indent=2, default=str)
+
+
+# ---------------------------------------------------------------------------
+# Publication mapping — the explicit source of command truth
+# ---------------------------------------------------------------------------
+
+PUBLISHED_COMMANDS: Dict[str, Callable] = {
+    "scan":      scan,
+    "find":      find,
+    "orient":    orient,
+    "status":    status,
+    "stale":     stale,
+    "drifts":    drifts,
+    "commands":  commands,
+    "help-json": help_json,
+    "help_json": help_json,
+    "map":       map_repo,
+    "map_repo":  map_repo,
+}
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
-PUBLISHED_COMMANDS = (
-    cmd_scan,
-    cmd_map,
-    cmd_find,
-    cmd_stale,
-    cmd_status,
-    cmd_orient,
-    cmd_drifts,
-    cmd_commands,
-    cmd_help_json,
-)
-
 
 def build_registry() -> PublishedCommandRegistry:
     """Create and populate the command registry from PUBLISHED_COMMANDS."""
     global REGISTRY
-    registry = PublishedCommandRegistry()
-    for func in PUBLISHED_COMMANDS:
-        registry.register(func)
-    REGISTRY = registry
-    return registry
+    REGISTRY = PublishedCommandRegistry.from_mapping(PUBLISHED_COMMANDS)
+    return REGISTRY
 
 
 def main() -> None:
