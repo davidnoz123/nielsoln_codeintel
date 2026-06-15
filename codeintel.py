@@ -2354,21 +2354,491 @@ def help_json() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Validation helpers
+# ---------------------------------------------------------------------------
+
+
+def _extract_source_entity_snapshot(
+    path: Path, repo_root: Path
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """
+    Run the appropriate LanguageExtractor for path and return
+    (language, normalised_records).
+
+    Each normalised record contains:
+        entity_type, name, qualified_name, parent_qualified_name,
+        start_line, end_line, detection_method, body_hash,
+        signature_text, docstring_text
+    """
+    extractors: List[LanguageExtractor] = [
+        SqlSchemaExtractor(),
+        PythonAstExtractor(),
+    ]
+    extractor: Optional[LanguageExtractor] = None
+    for ext in extractors:
+        if ext.supports_path(path):
+            extractor = ext
+            break
+
+    if extractor is None:
+        raise CommandError(f"unsupported_source_type: {path.suffix!r}")
+
+    raw = extractor.extract_file(path, repo_root)
+    if raw is None:
+        raise CommandError(f"extract_failed: could not parse {path}")
+
+    normalised: List[Dict[str, Any]] = []
+    for rec in raw:
+        sig_text = ""
+        doc_text = ""
+        for text_kind, text_body in rec.get("texts", []):
+            if text_kind == "signature":
+                sig_text = text_body or ""
+            elif text_kind == "docstring":
+                doc_text = text_body or ""
+        normalised.append(
+            {
+                "entity_type": rec["entity_type"],
+                "name": rec["name"],
+                "qualified_name": rec["qualified_name"],
+                "parent_qualified_name": rec.get("parent_qualified_name"),
+                "start_line": rec["start_line"],
+                "end_line": rec["end_line"],
+                "detection_method": rec["detection_method"],
+                "body_hash": _hash_text(rec["body_text"]),
+                "signature_text": sig_text,
+                "docstring_text": doc_text,
+            }
+        )
+    return extractor.language_name, normalised
+
+
+def _load_db_entity_snapshot(
+    db: CodeIndexDb, file_path: str
+) -> Tuple[Optional[sqlite3.Row], List[Dict[str, Any]]]:
+    """
+    Load the source_file row and active entity records for file_path.
+    Read-only; never modifies DB state.
+    Returns (source_file_row_or_None, normalised_db_records).
+    """
+    sf_rows = db.query(
+        "SELECT id, file_hash FROM source_file WHERE file_path = ?",
+        (file_path,),
+    )
+    if not sf_rows:
+        return None, []
+
+    sf_row = sf_rows[0]
+    sf_id = sf_row["id"]
+
+    rows = db.query(
+        """
+        WITH ent AS (
+            SELECT
+                ec.id          AS entity_id,
+                ec.qualified_name,
+                ec.name,
+                ec.entity_type,
+                ec.parent_entity_id,
+                ec.lifecycle_status,
+                el.start_line,
+                el.end_line,
+                el.detection_method
+            FROM code_entity ec
+            JOIN entity_location el
+              ON el.id = (
+                  SELECT el2.id FROM entity_location el2
+                  WHERE el2.entity_id = ec.id
+                  ORDER BY el2.scan_run_id DESC, el2.id DESC
+                  LIMIT 1
+              )
+            WHERE el.source_file_id = ?
+              AND ec.lifecycle_status = 'active'
+        ),
+        txt AS (
+            SELECT
+                entity_id,
+                MAX(CASE WHEN text_kind = 'signature'  THEN text_body END) AS sig,
+                MAX(CASE WHEN text_kind = 'docstring'  THEN text_body END) AS doc
+            FROM entity_text
+            WHERE entity_id IN (SELECT entity_id FROM ent)
+            GROUP BY entity_id
+        ),
+        hsh AS (
+            SELECT entity_id, hash_value
+            FROM entity_hash eh
+            WHERE hash_kind = 'body_sha256'
+              AND entity_id IN (SELECT entity_id FROM ent)
+              AND scan_run_id = (
+                  SELECT MAX(scan_run_id) FROM entity_hash eh2
+                  WHERE eh2.entity_id = eh.entity_id
+                    AND eh2.hash_kind  = 'body_sha256'
+              )
+        )
+        SELECT
+            e.entity_id,
+            e.qualified_name,
+            e.name,
+            e.entity_type,
+            e.start_line,
+            e.end_line,
+            e.detection_method,
+            COALESCE(t.sig, '') AS signature_text,
+            COALESCE(t.doc, '') AS docstring_text,
+            COALESCE(h.hash_value, '') AS body_hash
+        FROM ent e
+        LEFT JOIN txt t ON t.entity_id = e.entity_id
+        LEFT JOIN hsh h ON h.entity_id = e.entity_id
+        ORDER BY e.start_line, e.qualified_name
+        """,
+        (sf_id,),
+    )
+
+    normalised: List[Dict[str, Any]] = [
+        {
+            "qualified_name": r["qualified_name"],
+            "name": r["name"],
+            "entity_type": r["entity_type"],
+            "start_line": r["start_line"],
+            "end_line": r["end_line"],
+            "detection_method": r["detection_method"],
+            "signature_text": r["signature_text"] or "",
+            "docstring_text": r["docstring_text"] or "",
+            "body_hash": r["body_hash"] or "",
+        }
+        for r in rows
+    ]
+    return sf_row, normalised
+
+
+def _compare_source_and_db_snapshots(
+    source_records: List[Dict[str, Any]],
+    db_records: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Compare source and DB entity snapshots keyed by qualified_name.
+    Returns a list of issue dicts (severity, kind, qualified_name, message,
+    details).
+    """
+    src_by_qname: Dict[str, Dict] = {r["qualified_name"]: r for r in source_records}
+    db_by_qname:  Dict[str, Dict] = {r["qualified_name"]: r for r in db_records}
+
+    issues: List[Dict[str, Any]] = []
+
+    for qname in sorted(src_by_qname):
+        if qname not in db_by_qname:
+            issues.append(
+                {
+                    "severity": "error",
+                    "kind": "missing_in_db",
+                    "qualified_name": qname,
+                    "message": f"{qname!r} found in source but not in DB",
+                    "details": None,
+                }
+            )
+
+    for qname in sorted(db_by_qname):
+        if qname not in src_by_qname:
+            issues.append(
+                {
+                    "severity": "error",
+                    "kind": "missing_in_source",
+                    "qualified_name": qname,
+                    "message": f"{qname!r} found in DB but not in source",
+                    "details": None,
+                }
+            )
+
+    for qname in sorted(src_by_qname):
+        if qname not in db_by_qname:
+            continue
+        s = src_by_qname[qname]
+        d = db_by_qname[qname]
+
+        if s["body_hash"] and d["body_hash"] and s["body_hash"] != d["body_hash"]:
+            issues.append(
+                {
+                    "severity": "warning",
+                    "kind": "body_hash_mismatch",
+                    "qualified_name": qname,
+                    "message": f"{qname!r} body hash differs",
+                    "details": {
+                        "source": s["body_hash"][:12],
+                        "db": d["body_hash"][:12],
+                    },
+                }
+            )
+
+        if (s["start_line"], s["end_line"]) != (d["start_line"], d["end_line"]):
+            issues.append(
+                {
+                    "severity": "warning",
+                    "kind": "line_range_mismatch",
+                    "qualified_name": qname,
+                    "message": (
+                        f"{qname!r} line range differs: "
+                        f"source {s['start_line']}-{s['end_line']} "
+                        f"vs db {d['start_line']}-{d['end_line']}"
+                    ),
+                    "details": {
+                        "source": [s["start_line"], s["end_line"]],
+                        "db": [d["start_line"], d["end_line"]],
+                    },
+                }
+            )
+
+        s_sig = (s["signature_text"] or "").strip()
+        d_sig = (d["signature_text"] or "").strip()
+        if s_sig != d_sig:
+            issues.append(
+                {
+                    "severity": "warning",
+                    "kind": "signature_mismatch",
+                    "qualified_name": qname,
+                    "message": f"{qname!r} signature differs",
+                    "details": {"source": s_sig[:120], "db": d_sig[:120]},
+                }
+            )
+
+        s_doc = (s["docstring_text"] or "").strip()
+        d_doc = (d["docstring_text"] or "").strip()
+        if s_doc != d_doc:
+            issues.append(
+                {
+                    "severity": "warning",
+                    "kind": "docstring_mismatch",
+                    "qualified_name": qname,
+                    "message": f"{qname!r} docstring differs",
+                    "details": {
+                        "source": s_doc[:120],
+                        "db": d_doc[:120],
+                    },
+                }
+            )
+
+    return issues
+
+
+def _format_validation_report_text(report: Dict[str, Any]) -> str:
+    """Render a validation report dict as a human/agent-readable text string."""
+    ok_tag = "OK" if report["ok"] else "FAIL"
+    lines: List[str] = [
+        f"validate-source  [{ok_tag}]",
+        f"  source       : {report['source_path']}",
+        f"  db           : {report['db_path']}",
+        f"  repo root    : {report['repo_root']}",
+        f"  rel path     : {report['repo_relative_path']}",
+    ]
+
+    fhm = report["file_hash_match"]
+    hash_tag = "match" if fhm else ("MISMATCH" if fhm is False else "n/a")
+    lines.append(f"  file hash    : {hash_tag}")
+
+    s = report["summary"]
+    lines += [
+        "",
+        "  summary:",
+        f"    source entities      : {s['source_entities']}",
+        f"    db entities          : {s['db_entities']}",
+        f"    missing in db        : {s['missing_in_db']}",
+        f"    missing in source    : {s['missing_in_source']}",
+        f"    line range mismatches: {s['line_range_mismatches']}",
+        f"    signature mismatches : {s['signature_mismatches']}",
+        f"    docstring mismatches : {s['docstring_mismatches']}",
+        f"    body hash mismatches : {s['body_hash_mismatches']}",
+    ]
+
+    issues = report.get("issues", [])
+    if issues:
+        lines.append("")
+        lines.append("  issues:")
+        for iss in issues:
+            qn = f"  [{iss['qualified_name']}]" if iss.get("qualified_name") else ""
+            lines.append(
+                f"    [{iss['severity'].upper():7}] {iss['kind']}{qn}: {iss['message']}"
+            )
+            if iss.get("details"):
+                det = iss["details"]
+                if isinstance(det, dict):
+                    for k, v in det.items():
+                        lines.append(f"              {k}: {v}")
+    else:
+        lines.append("")
+        lines.append("  no issues found.")
+
+    return "\n".join(lines)
+
+
+def _format_validation_report_json(report: Dict[str, Any]) -> str:
+    """Render a validation report dict as a JSON string."""
+    return json.dumps(report, indent=2, default=str)
+
+
+# ---------------------------------------------------------------------------
+# validate_source — published command
+# ---------------------------------------------------------------------------
+
+
+def validate_source(
+    path: str,
+    *,
+    db_path: str = str(DEFAULT_DB_PATH),
+    format: str = "text",
+) -> str:
+    """
+    Validate one source file against a codeintel database.
+
+    Extract Python/SQL entities from path using the same extractor logic as
+    scan, then compare them with the active DB representation for that file.
+    Returns a text report by default, or JSON when format == 'json'.
+    """
+    if format not in ("text", "json"):
+        raise CommandError("format must be text or json")
+
+    source_path = Path(path).resolve()
+    if not source_path.exists():
+        raise CommandError(f"path does not exist: {source_path}")
+
+    db_file = Path(db_path)
+    if not db_file.exists():
+        raise CommandError(
+            f"no database found at {db_path}.  Run:  python codeintel.py scan <path>"
+        )
+
+    repo_slug, root_path_str, _branch = _get_repo_info(source_path)
+    repo_root = Path(root_path_str)
+    rel_path = _repo_relative_path(source_path, repo_root)
+
+    # Build base report skeleton.
+    report: Dict[str, Any] = {
+        "ok": False,
+        "db_path": str(db_file),
+        "source_path": str(source_path),
+        "repo_root": root_path_str,
+        "repo_relative_path": rel_path,
+        "file_hash_source": _hash_file(source_path),
+        "file_hash_db": None,
+        "file_hash_match": None,
+        "summary": {
+            "source_entities": 0,
+            "db_entities": 0,
+            "missing_in_db": 0,
+            "missing_in_source": 0,
+            "line_range_mismatches": 0,
+            "signature_mismatches": 0,
+            "docstring_mismatches": 0,
+            "body_hash_mismatches": 0,
+        },
+        "issues": [],
+    }
+
+    # --- Extract source snapshot ----------------------------------------
+    try:
+        _lang, source_records = _extract_source_entity_snapshot(
+            source_path, repo_root
+        )
+    except CommandError as exc:
+        kind = str(exc).split(":")[0].strip()
+        report["issues"].append(
+            {
+                "severity": "error",
+                "kind": kind,
+                "qualified_name": None,
+                "message": str(exc),
+                "details": None,
+            }
+        )
+        if format == "json":
+            return _format_validation_report_json(report)
+        return _format_validation_report_text(report)
+
+    report["summary"]["source_entities"] = len(source_records)
+
+    # --- Load DB snapshot --------------------------------------------------
+    db = CodeIndexDb(db_file)
+    try:
+        sf_row, db_records = _load_db_entity_snapshot(db, rel_path)
+    finally:
+        db.close()
+
+    if sf_row is None:
+        report["issues"].append(
+            {
+                "severity": "error",
+                "kind": "db_file_not_found",
+                "qualified_name": None,
+                "message": (
+                    f"{rel_path!r} not found in DB. "
+                    "Run 'scan' first."
+                ),
+                "details": None,
+            }
+        )
+        if format == "json":
+            return _format_validation_report_json(report)
+        return _format_validation_report_text(report)
+
+    report["file_hash_db"] = sf_row["file_hash"]
+    report["file_hash_match"] = (
+        report["file_hash_source"] == report["file_hash_db"]
+    )
+    if not report["file_hash_match"]:
+        report["issues"].append(
+            {
+                "severity": "warning",
+                "kind": "file_hash_mismatch",
+                "qualified_name": None,
+                "message": "File has changed since last scan",
+                "details": {
+                    "source": report["file_hash_source"][:12],
+                    "db": report["file_hash_db"][:12],
+                },
+            }
+        )
+
+    report["summary"]["db_entities"] = len(db_records)
+
+    # --- Compare -----------------------------------------------------------
+    issues = _compare_source_and_db_snapshots(source_records, db_records)
+    report["issues"].extend(issues)
+
+    # --- Tally summary counts --------------------------------------------
+    def _count(kind: str) -> int:
+        return sum(1 for i in report["issues"] if i["kind"] == kind)
+
+    report["summary"]["missing_in_db"]         = _count("missing_in_db")
+    report["summary"]["missing_in_source"]      = _count("missing_in_source")
+    report["summary"]["line_range_mismatches"]  = _count("line_range_mismatch")
+    report["summary"]["signature_mismatches"]   = _count("signature_mismatch")
+    report["summary"]["docstring_mismatches"]   = _count("docstring_mismatch")
+    report["summary"]["body_hash_mismatches"]   = _count("body_hash_mismatch")
+
+    error_count = sum(1 for i in report["issues"] if i["severity"] == "error")
+    report["ok"] = error_count == 0
+
+    if format == "json":
+        return _format_validation_report_json(report)
+    return _format_validation_report_text(report)
+
+
+# ---------------------------------------------------------------------------
 # Publication mapping — the explicit source of command truth
 # ---------------------------------------------------------------------------
 
 PUBLISHED_COMMANDS: Dict[str, Callable] = {
-    "scan":      scan,
-    "find":      find,
-    "orient":    orient,
-    "status":    status,
-    "stale":     stale,
-    "drifts":    drifts,
-    "commands":  commands,
-    "help-json": help_json,
-    "help_json": help_json,
-    "map":       map_repo,
-    "map_repo":  map_repo,
+    "scan":             scan,
+    "find":             find,
+    "orient":           orient,
+    "status":           status,
+    "stale":            stale,
+    "drifts":           drifts,
+    "commands":         commands,
+    "help-json":        help_json,
+    "help_json":        help_json,
+    "map":              map_repo,
+    "map_repo":         map_repo,
+    "validate-source":  validate_source,
+    "validate_source":  validate_source,
 }
 
 
