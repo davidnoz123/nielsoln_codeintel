@@ -2621,7 +2621,7 @@ def _compare_source_and_db_snapshots(
 
 def _format_validation_report_text(report: Dict[str, Any]) -> str:
     """Render a validation report dict as a human/agent-readable text string."""
-    ok_tag = "OK" if report["ok"] else "FAIL"
+    ok_tag = "CLEAN" if report["ok"] else "DRIFT"
     lines: List[str] = [
         f"validate-source  [{ok_tag}]",
         f"  source       : {report['source_path']}",
@@ -2813,8 +2813,14 @@ def validate_source(
     report["summary"]["docstring_mismatches"]   = _count("docstring_mismatch")
     report["summary"]["body_hash_mismatches"]   = _count("body_hash_mismatch")
 
-    error_count = sum(1 for i in report["issues"] if i["severity"] == "error")
-    report["ok"] = error_count == 0
+    report["summary"]["issues"]   = len(report["issues"])
+    report["summary"]["errors"]   = sum(
+        1 for i in report["issues"] if i["severity"] == "error"
+    )
+    report["summary"]["warnings"] = sum(
+        1 for i in report["issues"] if i["severity"] == "warning"
+    )
+    report["ok"] = report["summary"]["issues"] == 0
 
     if format == "json":
         return _format_validation_report_json(report)
