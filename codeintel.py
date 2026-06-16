@@ -283,6 +283,47 @@ LEFT JOIN entity_location el
 LEFT JOIN source_file sf
     ON sf.id = el.source_file_id
 WHERE de.status = 'open';
+
+-- ---------------------------------------------------------------------------
+-- Call observations
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS call_observation (
+    id               INTEGER PRIMARY KEY,
+    caller_entity_id INTEGER NOT NULL REFERENCES code_entity(id) ON DELETE CASCADE,
+    source_file_id   INTEGER NOT NULL REFERENCES source_file(id) ON DELETE CASCADE,
+    scan_run_id      INTEGER REFERENCES scan_run(id),
+    call_text        TEXT NOT NULL,
+    call_kind        TEXT NOT NULL,
+    start_line       INTEGER NOT NULL,
+    end_line         INTEGER NOT NULL,
+    confidence       TEXT NOT NULL DEFAULT 'observed'
+);
+
+CREATE INDEX IF NOT EXISTS ix_call_observation_caller_scan
+    ON call_observation(caller_entity_id, scan_run_id);
+
+CREATE INDEX IF NOT EXISTS ix_call_observation_call_text
+    ON call_observation(call_text);
+
+CREATE INDEX IF NOT EXISTS ix_call_observation_source_scan
+    ON call_observation(source_file_id, scan_run_id);
+
+CREATE VIEW IF NOT EXISTS v_call_observation AS
+SELECT
+    co.id AS call_observation_id,
+    co.scan_run_id,
+    caller.qualified_name AS caller_qualified_name,
+    caller.entity_type   AS caller_entity_type,
+    sf.file_path,
+    co.call_text,
+    co.call_kind,
+    co.start_line,
+    co.end_line,
+    co.confidence
+FROM call_observation co
+JOIN code_entity caller ON caller.id = co.caller_entity_id
+JOIN source_file sf     ON sf.id = co.source_file_id;
 """
 
 # ---------------------------------------------------------------------------
@@ -1279,6 +1320,37 @@ class CodeIndexDb:
             (entity_id, scan_run_id, drift_kind, old_hash, new_hash),
         )
 
+    # ------------------------------------------------------------------
+    # Call observations
+
+    def insert_call_observation(
+        self,
+        caller_entity_id: int,
+        source_file_id: int,
+        scan_run_id: int,
+        call_text: str,
+        call_kind: str,
+        start_line: int,
+        end_line: int,
+        confidence: str,
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO call_observation"
+            "(caller_entity_id, source_file_id, scan_run_id,"
+            " call_text, call_kind, start_line, end_line, confidence)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                caller_entity_id,
+                source_file_id,
+                scan_run_id,
+                call_text,
+                call_kind,
+                start_line,
+                end_line,
+                confidence,
+            ),
+        )
+
     def drift_event_exists(self, drift_event_id: int) -> bool:
         row = self._conn.execute(
             "SELECT 1 FROM drift_event WHERE id = ?",
@@ -1660,6 +1732,55 @@ class PythonAstExtractor(LanguageExtractor):
                         result.append(body)
         return result
 
+    @staticmethod
+    def _calls_in_body(stmts: list) -> List[Tuple[str, str, int, int]]:
+        """
+        Collect all call expressions in stmts as (call_text, call_kind,
+        start_line, end_line) tuples.
+
+        Traverses transparent containers (if, for, while, with, try, etc.)
+        but stops at nested ClassDef/FunctionDef/AsyncFunctionDef boundaries
+        so calls inside nested entities are not double-counted under the
+        enclosing entity.
+        """
+        result: List[Tuple[str, str, int, int]] = []
+        worklist: list = list(stmts)
+        while worklist:
+            node = worklist.pop()
+            if isinstance(
+                node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+            ):
+                continue
+            if isinstance(node, ast.Call):
+                func = node.func
+                if isinstance(func, ast.Name):
+                    text, kind = func.id, "name_call"
+                elif isinstance(func, ast.Attribute):
+                    attr = func.attr
+                    val = func.value
+                    if (
+                        isinstance(val, ast.Call)
+                        and isinstance(val.func, ast.Name)
+                        and val.func.id == "super"
+                    ):
+                        text, kind = f"super.{attr}", "super_call"
+                    elif isinstance(val, ast.Name) and val.id == "self":
+                        text, kind = f"self.{attr}", "self_call"
+                    elif isinstance(val, ast.Name):
+                        text, kind = f"{val.id}.{attr}", "attribute_call"
+                    else:
+                        text, kind = f"<expr>.{attr}", "attribute_call"
+                else:
+                    text, kind = "<unknown>", "unknown_call"
+                result.append((
+                    text,
+                    kind,
+                    node.lineno,
+                    getattr(node, "end_lineno", node.lineno),
+                ))
+            worklist.extend(ast.iter_child_nodes(node))
+        return result
+
     def _walk(
         self,
         body: list,
@@ -1760,6 +1881,17 @@ class PythonAstExtractor(LanguageExtractor):
         if docstring:
             texts.append(("docstring", docstring))
 
+        calls = [
+            {
+                "call_text": ct,
+                "call_kind": ck,
+                "start_line": sl,
+                "end_line": el,
+                "confidence": "observed",
+            }
+            for ct, ck, sl, el in self._calls_in_body(node.body)
+        ]
+
         records.append(
             {
                 "entity_type": entity_type,
@@ -1771,6 +1903,7 @@ class PythonAstExtractor(LanguageExtractor):
                 "detection_method": "python_ast",
                 "body_text": body_text,
                 "texts": texts,
+                "calls": calls,
             }
         )
 
@@ -1910,6 +2043,18 @@ class CodeScanner:
                     rec["end_line"],
                     rec["detection_method"],
                 )
+
+                for call in rec.get("calls", []):
+                    db.insert_call_observation(
+                        entity_id,
+                        source_file_id,
+                        scan_run_id,
+                        call["call_text"],
+                        call["call_kind"],
+                        call["start_line"],
+                        call["end_line"],
+                        call["confidence"],
+                    )
 
                 for text_kind, text_body in rec.get("texts", []):
                     if text_body:

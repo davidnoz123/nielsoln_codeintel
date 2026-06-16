@@ -903,6 +903,157 @@ def test_ast_transparent_containers() -> None:
 
 
 # ---------------------------------------------------------------------------
+# L. Python call observations
+# ---------------------------------------------------------------------------
+
+
+def test_call_observations() -> None:
+    print("\nL. Python call observations")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+
+        src = textwrap.dedent("""\
+            # calls.py — test module for call observation extraction
+
+            def direct_name():
+                load_config()
+
+            def attribute_call(service):
+                service.handle()
+
+            class Service:
+                def run(self):
+                    self.save()
+
+            class Child(Base):
+                def run(self):
+                    super().run()
+
+            def outer():
+                setup()
+                def inner():
+                    work()
+
+            def run_with_flag(flag):
+                if flag:
+                    do_it()
+        """)
+        (tmp / "calls.py").write_text(src)
+        res = run_ci(["scan", "calls.py"], tmp)
+        _assert("L: scan exits 0", res.returncode == 0, res.stderr)
+
+        # ------------------------------------------------------------------
+        # L1 — direct name call
+        row = q1(
+            tmp,
+            "SELECT call_kind FROM v_call_observation "
+            "WHERE caller_qualified_name LIKE '%.direct_name' "
+            "AND call_text = 'load_config'",
+        )
+        _assert("L1: name_call present", row is not None, "load_config not found")
+        if row:
+            _assert_eq("L1: name_call kind", row["call_kind"], "name_call")
+
+        # ------------------------------------------------------------------
+        # L2 — attribute call
+        row = q1(
+            tmp,
+            "SELECT call_kind FROM v_call_observation "
+            "WHERE caller_qualified_name LIKE '%.attribute_call' "
+            "AND call_text = 'service.handle'",
+        )
+        _assert("L2: attribute_call present", row is not None, "service.handle not found")
+        if row:
+            _assert_eq("L2: attribute_call kind", row["call_kind"], "attribute_call")
+
+        # ------------------------------------------------------------------
+        # L3 — self call
+        row = q1(
+            tmp,
+            "SELECT call_kind FROM v_call_observation "
+            "WHERE caller_qualified_name LIKE '%.Service.run' "
+            "AND call_text = 'self.save'",
+        )
+        _assert("L3: self_call present", row is not None, "self.save not found")
+        if row:
+            _assert_eq("L3: self_call kind", row["call_kind"], "self_call")
+
+        # ------------------------------------------------------------------
+        # L4 — super call
+        row = q1(
+            tmp,
+            "SELECT call_kind FROM v_call_observation "
+            "WHERE caller_qualified_name LIKE '%.Child.run' "
+            "AND call_text = 'super.run'",
+        )
+        _assert("L4: super_call present", row is not None, "super.run not found")
+        if row:
+            _assert_eq("L4: super_call kind", row["call_kind"], "super_call")
+
+        # ------------------------------------------------------------------
+        # L5 — nested function ownership: setup under outer, work under inner
+        row_setup = q1(
+            tmp,
+            "SELECT 1 FROM v_call_observation "
+            "WHERE caller_qualified_name LIKE '%.outer' "
+            "AND call_text = 'setup'",
+        )
+        _assert("L5: setup under outer", row_setup is not None)
+
+        row_work_inner = q1(
+            tmp,
+            "SELECT 1 FROM v_call_observation "
+            "WHERE caller_qualified_name LIKE '%.outer.inner' "
+            "AND call_text = 'work'",
+        )
+        _assert("L5: work under outer.inner", row_work_inner is not None)
+
+        # work must NOT appear under outer
+        row_work_outer = q1(
+            tmp,
+            "SELECT 1 FROM v_call_observation "
+            "WHERE caller_qualified_name LIKE '%.outer' "
+            "AND call_text = 'work'",
+        )
+        _assert("L5: work NOT double-counted under outer", row_work_outer is None)
+
+        # ------------------------------------------------------------------
+        # L6 — transparent container: do_it attributed to run_with_flag
+        row = q1(
+            tmp,
+            "SELECT 1 FROM v_call_observation "
+            "WHERE caller_qualified_name LIKE '%.run_with_flag' "
+            "AND call_text = 'do_it'",
+        )
+        _assert("L6: call inside if attributed to enclosing function", row is not None)
+
+        # ------------------------------------------------------------------
+        # L7 — module and class body calls are NOT in scope for this bundle.
+        # Only python_function / python_method / python_nested_function
+        # entities produce call observations.
+        #
+        # Verify entity types that have at least one call are function-like.
+        rows = qall(
+            tmp,
+            "SELECT DISTINCT caller_entity_type FROM v_call_observation",
+        )
+        non_function_types = [
+            r["caller_entity_type"]
+            for r in rows
+            if r["caller_entity_type"] not in (
+                "python_function",
+                "python_method",
+                "python_nested_function",
+            )
+        ]
+        _assert(
+            "L7: only function-like entities emit call observations",
+            non_function_types == [],
+            f"unexpected types: {non_function_types}",
+        )
+
+
+# ---------------------------------------------------------------------------
 
 
 def main() -> None:
@@ -921,6 +1072,7 @@ def main() -> None:
     test_published_command_registry()
     test_path_root_semantics()
     test_ast_transparent_containers()
+    test_call_observations()
 
     total  = len(_results)
     passed = sum(1 for _, ok, _ in _results if ok)

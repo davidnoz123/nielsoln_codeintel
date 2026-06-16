@@ -99,3 +99,31 @@ stale checks, and vanished-file detection.
 Subdirectory scans only check files under that subdirectory's prefix for
 vanished-file detection.  Files outside the prefix are never marked removed
 by a subdirectory scan.
+
+## 10. Call observations
+
+CodeIntel records **observed call expressions** found inside Python
+function/method/nested-function bodies.  These are stored in
+`call_observation` and readable via the `v_call_observation` view.
+
+What call observations are:
+- factual AST observations of call syntax present in source at scan time;
+- linked to the enclosing function/method entity as the `caller`;
+- classified by `call_kind`: `name_call`, `attribute_call`, `self_call`,
+  `super_call`, or `unknown_call`.
+
+What call observations are **not**:
+- guaranteed resolved callees — the `callee_entity_id` column does not exist
+  in this version;
+- dynamic binding analysis — Python method dispatch is not modelled;
+- exhaustive across all entity types — module-level and class-body calls are
+  not recorded in this version; only function-like entities
+  (`python_function`, `python_method`, `python_nested_function`) produce
+  call observations.
+
+Agent guidance:
+- use `v_call_observation` to **narrow** which source functions to read
+  before editing call sites;
+- do **not** assume a call observation proves that a specific callee entity
+  is always invoked at runtime;
+- always read source before editing call behaviour.
