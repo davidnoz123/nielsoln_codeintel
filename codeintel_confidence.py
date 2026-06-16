@@ -776,6 +776,133 @@ def test_path_root_semantics() -> None:
 
 
 # ---------------------------------------------------------------------------
+# K. Python AST transparent containers
+# ---------------------------------------------------------------------------
+
+
+def test_ast_transparent_containers() -> None:
+    print("\nK. Python AST transparent containers")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+
+        (tmp / "containers.py").write_text(textwrap.dedent("""\
+            import contextlib
+
+            if True:
+                def inside_if(): pass
+
+            if True:
+                class InsideIfClass: pass
+
+            if True:
+                async def async_inside_if(): pass
+
+            if False:
+                pass
+            else:
+                def inside_else(): pass
+
+            try:
+                def inside_try(): pass
+            except Exception:
+                pass
+
+            try:
+                pass
+            except Exception:
+                def inside_except(): pass
+
+            try:
+                pass
+            finally:
+                def inside_finally(): pass
+
+            for _ in []:
+                def inside_for(): pass
+
+            while False:
+                def inside_while(): pass
+
+            with contextlib.suppress(Exception):
+                def inside_with(): pass
+
+            def outer():
+                if True:
+                    def inner(): pass
+        """), encoding="utf-8")
+
+        run_ci(["scan", str(tmp)], tmp)
+
+        def _exists(qname: str) -> bool:
+            return q1(tmp,
+                "SELECT qualified_name FROM v_entity_current "
+                "WHERE qualified_name = ?",
+                (qname,)) is not None
+
+        _assert("K1:  function inside module-level if",
+            _exists("containers.inside_if"))
+        _assert("K2:  class inside module-level if",
+            _exists("containers.InsideIfClass"))
+        _assert("K3:  async function inside module-level if",
+            _exists("containers.async_inside_if"))
+        _assert("K4:  function inside else block",
+            _exists("containers.inside_else"))
+        _assert("K5:  function inside try body",
+            _exists("containers.inside_try"))
+        _assert("K6:  function inside except handler",
+            _exists("containers.inside_except"))
+        _assert("K7:  function inside finally",
+            _exists("containers.inside_finally"))
+        _assert("K8:  function inside for body",
+            _exists("containers.inside_for"))
+        _assert("K9:  function inside while body",
+            _exists("containers.inside_while"))
+        _assert("K10: function inside with body",
+            _exists("containers.inside_with"))
+        _assert("K11: nested function inside function-level if",
+            _exists("containers.outer.inner"))
+
+        # Parent of inner must be outer, not the if-node.
+        inner_row = q1(tmp,
+            """
+            SELECT ce_parent.qualified_name AS parent_qname
+            FROM code_entity ce
+            JOIN code_entity ce_parent ON ce_parent.id = ce.parent_entity_id
+            WHERE ce.qualified_name = 'containers.outer.inner'
+            """)
+        _assert("K11: outer.inner parent qname is containers.outer",
+            inner_row is not None
+            and inner_row["parent_qname"] == "containers.outer",
+            f"got {dict(inner_row) if inner_row else None}")
+
+        # No duplicate entity rows for any containers.* entity.
+        dups = qall(tmp,
+            "SELECT qualified_name, COUNT(*) AS n FROM code_entity "
+            "WHERE qualified_name LIKE 'containers.%' "
+            "GROUP BY qualified_name HAVING n > 1")
+        _assert("K:   no duplicate entity rows",
+            len(dups) == 0,
+            f"duplicates: {[dict(r) for r in dups]}")
+
+    # match/case — guarded: only run on Python 3.10+
+    if sys.version_info >= (3, 10):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            (tmp / "matchmod.py").write_text(textwrap.dedent("""\
+                def check(x):
+                    match x:
+                        case 1:
+                            def inside_match(): pass
+            """), encoding="utf-8")
+            run_ci(["scan", str(tmp)], tmp)
+            _assert("K12: function inside match/case (Python 3.10+)",
+                q1(tmp,
+                    "SELECT qualified_name FROM v_entity_current "
+                    "WHERE qualified_name = 'matchmod.check.inside_match'"
+                ) is not None)
+
+
+# ---------------------------------------------------------------------------
 
 
 def main() -> None:
@@ -793,6 +920,7 @@ def main() -> None:
     test_new_commands()
     test_published_command_registry()
     test_path_root_semantics()
+    test_ast_transparent_containers()
 
     total  = len(_results)
     passed = sum(1 for _, ok, _ in _results if ok)

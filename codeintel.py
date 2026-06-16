@@ -1632,6 +1632,34 @@ class PythonAstExtractor(LanguageExtractor):
         self._walk(tree.body, module_qname, module_qname, "module", lines, records)
         return records
 
+    @staticmethod
+    def _child_stmts(node: ast.AST) -> List[list]:
+        """
+        Return all direct child statement-lists reachable from a transparent
+        container node (if, for, while, with, try, except, finally, else,
+        match/case, etc.).
+
+        ClassDef and FunctionDef bodies are handled by the visitor methods;
+        this helper is only called for everything else.
+        """
+        result: List[list] = []
+        for _name, value in ast.iter_fields(node):
+            if not isinstance(value, list) or not value:
+                continue
+            first = value[0]
+            if isinstance(first, ast.stmt):
+                # Direct statement list: if.body, for.body, try.body,
+                # try.orelse, try.finalbody, while.body, with.body, etc.
+                result.append(value)
+            elif isinstance(first, ast.AST) and hasattr(first, "body"):
+                # Handler/case lists whose elements carry their own body:
+                # try.handlers (ExceptHandler), match.cases (match_case).
+                for item in value:
+                    body = getattr(item, "body", None)
+                    if body:
+                        result.append(body)
+        return result
+
     def _walk(
         self,
         body: list,
@@ -1650,6 +1678,20 @@ class PythonAstExtractor(LanguageExtractor):
                 self._visit_function(
                     node, module_qname, parent_qname, context, lines, records
                 )
+            else:
+                # Transparent container (if, for, while, with, try, match,
+                # etc.) — descend with the same parent_qname and context so
+                # any definitions found inside are attributed to the correct
+                # enclosing entity, not to the control-flow construct itself.
+                for child_body in self._child_stmts(node):
+                    self._walk(
+                        child_body,
+                        module_qname,
+                        parent_qname,
+                        context,
+                        lines,
+                        records,
+                    )
 
     def _visit_class(
         self,
