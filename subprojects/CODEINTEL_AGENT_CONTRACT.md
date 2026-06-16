@@ -80,3 +80,22 @@ Do not commit generated runtime databases by default:
 ```
 .codeintel/codeintel.sqlite
 ```
+
+## 9. Path model
+
+`git_repo.root_path` is the root used for all repo-relative paths.
+
+`source_file.file_path` is the stable relative path used for entity lookup,
+stale checks, and vanished-file detection.
+
+| Scan type | root_path | source_file.file_path |
+|---|---|---|
+| Git repo root | git root | `relative/to/git/root.py` |
+| Git subdirectory | git root | `subdir/file.py` (relative to git root, not subdir) |
+| Single git file | git root | `path/to/file.py` (relative to git root) |
+| Non-git directory | scan directory | `file.py` (relative to scan directory) |
+| Non-git single file | file's parent directory | `file.py` |
+
+Subdirectory scans only check files under that subdirectory's prefix for
+vanished-file detection.  Files outside the prefix are never marked removed
+by a subdirectory scan.

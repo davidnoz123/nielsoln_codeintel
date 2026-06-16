@@ -658,6 +658,124 @@ def test_published_command_registry() -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+# J. Path / repo-root semantics
+# ---------------------------------------------------------------------------
+
+
+def test_path_root_semantics() -> None:
+    print("\nJ. Path / repo-root semantics")
+
+    # J1 — whole-repo git scan stores paths relative to the git root.
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        (tmp / ".git").mkdir()
+        (tmp / "main.py").write_text("def foo(): pass\n", encoding="utf-8")
+        run_ci(["scan", str(tmp)], tmp)
+        row = q1(tmp,
+            "SELECT file_path FROM source_file WHERE file_path = 'main.py'")
+        _assert("J1: whole-repo scan stores bare repo-relative path",
+            row is not None, "expected file_path='main.py'")
+
+    # J2 — subdirectory scan stores paths relative to the git root,
+    #       not relative to the subdirectory.
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        (tmp / ".git").mkdir()
+        sub = tmp / "sub"
+        sub.mkdir()
+        (sub / "util.py").write_text("def bar(): pass\n", encoding="utf-8")
+        (tmp / "root_mod.py").write_text("def baz(): pass\n", encoding="utf-8")
+        # Scan only the subdirectory.
+        run_ci(["scan", str(sub)], tmp)
+        row = q1(tmp,
+            "SELECT file_path FROM source_file WHERE file_path = 'sub/util.py'")
+        _assert("J2: subdirectory scan stores path relative to git root",
+            row is not None, "expected file_path='sub/util.py'")
+
+    # J3 — single-file scan stores the correct repo-relative path.
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        (tmp / ".git").mkdir()
+        pkg = tmp / "pkg"
+        pkg.mkdir()
+        (pkg / "mod.py").write_text("def func(): pass\n", encoding="utf-8")
+        run_ci(["scan", str(pkg / "mod.py")], tmp)
+        row = q1(tmp,
+            "SELECT file_path FROM source_file WHERE file_path = 'pkg/mod.py'")
+        _assert("J3: single-file scan stores repo-relative path",
+            row is not None, "expected file_path='pkg/mod.py'")
+
+    # J4 — non-git directory scan uses the scan root itself; paths are
+    #       relative to that root, not to cwd.
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        # No .git intentionally.
+        (tmp / "foo.py").write_text("def alpha(): pass\n", encoding="utf-8")
+        run_ci(["scan", str(tmp)], tmp)
+        row = q1(tmp,
+            "SELECT file_path FROM source_file WHERE file_path = 'foo.py'")
+        _assert("J4: non-git scan stores bare filename as file_path",
+            row is not None, "expected file_path='foo.py'")
+        # Sanity: root_path stored in git_repo should match the scan root.
+        repo_row = q1(tmp, "SELECT root_path FROM git_repo LIMIT 1")
+        _assert("J4: non-git scan stores scan dir as root_path",
+            repo_row is not None and
+            Path(repo_row["root_path"]).resolve() == tmp.resolve(),
+            f"got root_path={repo_row['root_path'] if repo_row else None}")
+
+    # J5 — stale detects a file modified after a scan.
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        (tmp / ".git").mkdir()
+        f = tmp / "hello.py"
+        f.write_text("def hi(): pass\n", encoding="utf-8")
+        run_ci(["scan", str(tmp)], tmp)
+        f.write_text("def hi(): return 1\n", encoding="utf-8")
+        r = run_ci(["stale"], tmp)
+        _assert("J5: stale exits 0 after file modification",
+            r.returncode == 0, r.stderr.strip())
+        _assert("J5: stale reports modified file",
+            "hello.py" in r.stdout, r.stdout.strip())
+
+    # J6 — directory scan detects a previously scanned file that was deleted.
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        (tmp / ".git").mkdir()
+        (tmp / "alive.py").write_text("def stay(): pass\n", encoding="utf-8")
+        dead = tmp / "dead.py"
+        dead.write_text("def gone(): pass\n", encoding="utf-8")
+        run_ci(["scan", str(tmp)], tmp)
+        dead.unlink()
+        run_ci(["scan", str(tmp)], tmp)
+        row = q1(tmp,
+            "SELECT lifecycle_status FROM code_entity "
+            "WHERE qualified_name = 'dead.gone'")
+        _assert("J6: deleted file's entity marked removed",
+            row is not None and row["lifecycle_status"] == "removed",
+            f"got {dict(row) if row else None}")
+
+    # J7 — subdirectory scan does NOT mark files outside that subdirectory
+    #       as vanished.
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        (tmp / ".git").mkdir()
+        inner = tmp / "inner"
+        inner.mkdir()
+        (tmp / "outer.py").write_text("def outside(): pass\n", encoding="utf-8")
+        (inner / "inner.py").write_text("def inside(): pass\n", encoding="utf-8")
+        # Full-repo scan first — both files registered.
+        run_ci(["scan", str(tmp)], tmp)
+        # Subdirectory-only rescan — must not vanish outer.py.
+        run_ci(["scan", str(inner)], tmp)
+        row = q1(tmp,
+            "SELECT lifecycle_status FROM code_entity "
+            "WHERE qualified_name = 'outer.outside'")
+        _assert("J7: subdir rescan does not vanish entities outside subdir",
+            row is not None and row["lifecycle_status"] == "active",
+            f"got {dict(row) if row else None}")
+
+
+# ---------------------------------------------------------------------------
 
 
 def main() -> None:
@@ -674,6 +792,7 @@ def main() -> None:
     test_sql_qnames()
     test_new_commands()
     test_published_command_registry()
+    test_path_root_semantics()
 
     total  = len(_results)
     passed = sum(1 for _, ok, _ in _results if ok)
