@@ -31,8 +31,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 # Version constants
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = "1.1.2"
-SCANNER_VERSION = "codeintel 1.1.2"
+SCHEMA_VERSION = "1.2.0"
+SCANNER_VERSION = "codeintel 1.2.0"
 DEFAULT_DB_PATH = Path(".codeintel") / "codeintel.sqlite"
 
 # ---------------------------------------------------------------------------
@@ -324,6 +324,30 @@ SELECT
 FROM call_observation co
 JOIN code_entity caller ON caller.id = co.caller_entity_id
 JOIN source_file sf     ON sf.id = co.source_file_id;
+
+CREATE VIEW IF NOT EXISTS v_call_observation_current AS
+SELECT
+    co.id AS call_observation_id,
+    co.scan_run_id,
+    caller.qualified_name AS caller_qualified_name,
+    caller.entity_type   AS caller_entity_type,
+    sf.file_path,
+    co.call_text,
+    co.call_kind,
+    co.start_line,
+    co.end_line,
+    co.confidence
+FROM call_observation co
+JOIN code_entity caller ON caller.id = co.caller_entity_id
+JOIN source_file sf     ON sf.id = co.source_file_id
+WHERE caller.lifecycle_status = 'active'
+  AND co.scan_run_id = (
+      SELECT el2.scan_run_id
+      FROM entity_location el2
+      WHERE el2.entity_id = co.caller_entity_id
+      ORDER BY el2.scan_run_id DESC, el2.id DESC
+      LIMIT 1
+  );
 """
 
 # ---------------------------------------------------------------------------
@@ -1753,6 +1777,7 @@ class PythonAstExtractor(LanguageExtractor):
                 continue
             if isinstance(node, ast.Call):
                 func = node.func
+                is_super_call = False
                 if isinstance(func, ast.Name):
                     text, kind = func.id, "name_call"
                 elif isinstance(func, ast.Attribute):
@@ -1764,6 +1789,7 @@ class PythonAstExtractor(LanguageExtractor):
                         and val.func.id == "super"
                     ):
                         text, kind = f"super.{attr}", "super_call"
+                        is_super_call = True
                     elif isinstance(val, ast.Name) and val.id == "self":
                         text, kind = f"self.{attr}", "self_call"
                     elif isinstance(val, ast.Name):
@@ -1778,7 +1804,17 @@ class PythonAstExtractor(LanguageExtractor):
                     node.lineno,
                     getattr(node, "end_lineno", node.lineno),
                 ))
-            worklist.extend(ast.iter_child_nodes(node))
+                if is_super_call:
+                    # Traverse call arguments but skip func.value (the inner
+                    # super() sub-call) to avoid emitting a redundant bare
+                    # name_call for 'super' alongside the super_call.
+                    worklist.extend(node.args)
+                    for kw in node.keywords:
+                        worklist.append(kw.value)
+                else:
+                    worklist.extend(ast.iter_child_nodes(node))
+            else:
+                worklist.extend(ast.iter_child_nodes(node))
         return result
 
     def _walk(

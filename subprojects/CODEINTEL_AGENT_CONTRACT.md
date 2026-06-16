@@ -104,7 +104,14 @@ by a subdirectory scan.
 
 CodeIntel records **observed call expressions** found inside Python
 function/method/nested-function bodies.  These are stored in
-`call_observation` and readable via the `v_call_observation` view.
+`call_observation` and readable via two views:
+
+- `v_call_observation_current` — **use this for orientation**: shows only
+  observations from the most recent scan of each caller entity, and only for
+  active entities.  Always prefer this view when narrowing source reads.
+- `v_call_observation` — full history across all scan runs.  Useful when
+  you need to compare across scans, but contains stale observations from
+  previous scans alongside current ones.
 
 What call observations are:
 - factual AST observations of call syntax present in source at scan time;

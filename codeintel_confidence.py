@@ -1052,6 +1052,74 @@ def test_call_observations() -> None:
             f"unexpected types: {non_function_types}",
         )
 
+        # ------------------------------------------------------------------
+        # L10 — super().method() must NOT also emit a bare name_call for 'super'
+        bare_super = q1(
+            tmp,
+            "SELECT 1 FROM v_call_observation "
+            "WHERE caller_qualified_name LIKE '%.Child.run' "
+            "AND call_text = 'super' AND call_kind = 'name_call'",
+        )
+        _assert("L10: super().run() does NOT emit bare super name_call", bare_super is None)
+
+    # ------------------------------------------------------------------
+    # L8 / L9 — v_call_observation_current vs. historical after rescan
+    with tempfile.TemporaryDirectory() as td2:
+        tmp2 = Path(td2)
+        (tmp2 / "evolve.py").write_text(
+            "def run():\n    load_config()\n", encoding="utf-8"
+        )
+        run_ci(["scan", "evolve.py"], tmp2)
+
+        row_before = q1(
+            tmp2,
+            "SELECT 1 FROM v_call_observation_current "
+            "WHERE caller_qualified_name LIKE '%.run' "
+            "AND call_text = 'load_config'",
+        )
+        _assert("L8: current view shows call before rescan", row_before is not None)
+
+        # Modify to a different call, then rescan
+        (tmp2 / "evolve.py").write_text(
+            "def run():\n    something_else()\n", encoding="utf-8"
+        )
+        run_ci(["scan", "evolve.py"], tmp2)
+
+        row_old = q1(
+            tmp2,
+            "SELECT 1 FROM v_call_observation_current "
+            "WHERE caller_qualified_name LIKE '%.run' "
+            "AND call_text = 'load_config'",
+        )
+        _assert(
+            "L8: stale call absent from v_call_observation_current after rescan",
+            row_old is None,
+        )
+
+        row_new = q1(
+            tmp2,
+            "SELECT 1 FROM v_call_observation_current "
+            "WHERE caller_qualified_name LIKE '%.run' "
+            "AND call_text = 'something_else'",
+        )
+        _assert(
+            "L8: updated call present in v_call_observation_current after rescan",
+            row_new is not None,
+        )
+
+        # L9 — v_call_observation (all-history) retains both scan runs
+        rows_all = qall(
+            tmp2,
+            "SELECT call_text FROM v_call_observation "
+            "WHERE caller_qualified_name LIKE '%.run' "
+            "ORDER BY call_text",
+        )
+        texts = {r["call_text"] for r in rows_all}
+        _assert("L9: v_call_observation retains load_config historically",
+                "load_config" in texts)
+        _assert("L9: v_call_observation retains something_else historically",
+                "something_else" in texts)
+
 
 # ---------------------------------------------------------------------------
 
