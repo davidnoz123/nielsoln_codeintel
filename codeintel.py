@@ -31,12 +31,12 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 # Version constants
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = "1.2.0"
-SCANNER_VERSION = "codeintel 1.2.0"
+SCHEMA_VERSION = "1.3.0"
+SCANNER_VERSION = "codeintel 1.3.0"
 DEFAULT_DB_PATH = Path(".codeintel") / "codeintel.sqlite"
 
 # ---------------------------------------------------------------------------
-# Embedded schema — v1.1.2
+# Embedded schema — v1.2.0 / v1.3.0
 # Note: entity_location.detection_method has NO DEFAULT.
 # Every extractor must supply the value explicitly.
 # ---------------------------------------------------------------------------
@@ -345,6 +345,74 @@ WHERE caller.lifecycle_status = 'active'
       SELECT el2.scan_run_id
       FROM entity_location el2
       WHERE el2.entity_id = co.caller_entity_id
+      ORDER BY el2.scan_run_id DESC, el2.id DESC
+      LIMIT 1
+  );
+
+-- ---------------------------------------------------------------------------
+-- Symbol observations (external/interface coupling only)
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS symbol_observation (
+    id              INTEGER PRIMARY KEY,
+    owner_entity_id INTEGER NOT NULL REFERENCES code_entity(id) ON DELETE CASCADE,
+    source_file_id  INTEGER NOT NULL REFERENCES source_file(id) ON DELETE CASCADE,
+    scan_run_id     INTEGER REFERENCES scan_run(id),
+    symbol_name     TEXT NOT NULL,
+    access_kind     TEXT NOT NULL,
+    scope_hint      TEXT NOT NULL DEFAULT 'unknown',
+    start_line      INTEGER NOT NULL,
+    end_line        INTEGER NOT NULL,
+    confidence      TEXT NOT NULL DEFAULT 'observed'
+);
+
+CREATE INDEX IF NOT EXISTS ix_symbol_observation_owner_scan
+    ON symbol_observation(owner_entity_id, scan_run_id);
+
+CREATE INDEX IF NOT EXISTS ix_symbol_observation_symbol
+    ON symbol_observation(symbol_name);
+
+CREATE INDEX IF NOT EXISTS ix_symbol_observation_source_scan
+    ON symbol_observation(source_file_id, scan_run_id);
+
+CREATE VIEW IF NOT EXISTS v_symbol_observation AS
+SELECT
+    so.id AS symbol_observation_id,
+    so.scan_run_id,
+    owner.qualified_name AS owner_qualified_name,
+    owner.entity_type   AS owner_entity_type,
+    sf.file_path,
+    so.symbol_name,
+    so.access_kind,
+    so.scope_hint,
+    so.start_line,
+    so.end_line,
+    so.confidence
+FROM symbol_observation so
+JOIN code_entity owner ON owner.id = so.owner_entity_id
+JOIN source_file sf    ON sf.id = so.source_file_id;
+
+CREATE VIEW IF NOT EXISTS v_symbol_observation_current AS
+SELECT
+    so.id AS symbol_observation_id,
+    so.scan_run_id,
+    owner.qualified_name AS owner_qualified_name,
+    owner.entity_type   AS owner_entity_type,
+    sf.file_path,
+    so.symbol_name,
+    so.access_kind,
+    so.scope_hint,
+    so.start_line,
+    so.end_line,
+    so.confidence
+FROM symbol_observation so
+JOIN code_entity owner ON owner.id = so.owner_entity_id
+JOIN source_file sf    ON sf.id = so.source_file_id
+WHERE owner.lifecycle_status = 'active'
+  AND so.scan_run_id = (
+      SELECT el2.scan_run_id
+      FROM entity_location el2
+      WHERE el2.entity_id = so.owner_entity_id
       ORDER BY el2.scan_run_id DESC, el2.id DESC
       LIMIT 1
   );
@@ -1375,6 +1443,37 @@ class CodeIndexDb:
             ),
         )
 
+    def insert_symbol_observation(
+        self,
+        owner_entity_id: int,
+        source_file_id: int,
+        scan_run_id: int,
+        symbol_name: str,
+        access_kind: str,
+        scope_hint: str,
+        start_line: int,
+        end_line: int,
+        confidence: str,
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO symbol_observation"
+            "(owner_entity_id, source_file_id, scan_run_id,"
+            " symbol_name, access_kind, scope_hint,"
+            " start_line, end_line, confidence)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                owner_entity_id,
+                source_file_id,
+                scan_run_id,
+                symbol_name,
+                access_kind,
+                scope_hint,
+                start_line,
+                end_line,
+                confidence,
+            ),
+        )
+
     def drift_event_exists(self, drift_event_id: int) -> bool:
         row = self._conn.execute(
             "SELECT 1 FROM drift_event WHERE id = ?",
@@ -1942,6 +2041,18 @@ class PythonAstExtractor(LanguageExtractor):
             for ct, ck, sl, el in self._calls_in_body(node.body)
         ]
 
+        symbols = [
+            {
+                "symbol_name": sn,
+                "access_kind": ak,
+                "scope_hint": sh,
+                "start_line": sl,
+                "end_line": el,
+                "confidence": "observed",
+            }
+            for sn, ak, sh, sl, el in self._collect_symbol_observations(node)
+        ]
+
         records.append(
             {
                 "entity_type": entity_type,
@@ -1954,16 +2065,230 @@ class PythonAstExtractor(LanguageExtractor):
                 "body_text": body_text,
                 "texts": texts,
                 "calls": calls,
+                "symbols": symbols,
             }
         )
 
         # Recurse into the function body; nested items have context='function'
         self._walk(node.body, module_qname, qname, "function", lines, records)
 
+    @staticmethod
+    def _collect_symbol_observations(
+        node,  # ast.FunctionDef or ast.AsyncFunctionDef
+    ) -> List[Tuple[str, str, str, int, int]]:
+        """
+        Collect external/interface symbol observations for a single
+        function-like AST node.  Returns a list of
+        (symbol_name, access_kind, scope_hint, start_line, end_line).
 
-# ---------------------------------------------------------------------------
-# CodeScanner — orchestrator
-# ---------------------------------------------------------------------------
+        Only function-like entities are scoped here; class/module bodies are
+        not processed.  Nested function/class definitions are skipped so each
+        nested entity collects its own observations without double-counting.
+
+        Persists: params, global/nonlocal decls, import bindings, reads of
+        externally-unbound names, writes/deletes to declared global/nonlocal.
+        Does NOT persist: ordinary local assignments, loop targets, with-as
+        locals, except-handler locals, or their reads.
+        """
+        result: List[Tuple[str, str, str, int, int]] = []
+
+        # --- Pass 1: collect local binders (used only for noise suppression)
+        # These are names that are purely local to this function body and
+        # should NOT be persisted as external_read observations.
+        local_binders: set = set()
+        # Parameters — also persisted; added separately
+        global_decls: set = set()
+        nonlocal_decls: set = set()
+        import_bindings: set = set()
+
+        # Helper: extract simple Name targets from an assignment target tree
+        def _names_in_target(t) -> List[str]:
+            if isinstance(t, ast.Name):
+                return [t.id]
+            if isinstance(t, (ast.Tuple, ast.List)):
+                names: List[str] = []
+                for elt in t.elts:
+                    names.extend(_names_in_target(elt))
+                return names
+            return []
+
+        # Parameters
+        params = node.args
+        for arg in (
+            list(params.args)
+            + list(params.posonlyargs)
+            + list(params.kwonlyargs)
+            + ([params.vararg] if params.vararg else [])
+            + ([params.kwarg] if params.kwarg else [])
+        ):
+            local_binders.add(arg.arg)
+
+        # Walk the direct body (not descending into nested funcs/classes)
+        worklist_pass1: list = list(node.body)
+        while worklist_pass1:
+            n = worklist_pass1.pop()
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue  # nested entity boundary
+            if isinstance(n, ast.Global):
+                global_decls.update(n.names)
+            elif isinstance(n, ast.Nonlocal):
+                nonlocal_decls.update(n.names)
+            elif isinstance(n, (ast.Import, ast.ImportFrom)):
+                for alias in n.names:
+                    bound_name = alias.asname if alias.asname else (
+                        alias.name.split(".")[0]
+                    )
+                    import_bindings.add(bound_name)
+            elif isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                # Collect assignment targets for noise suppression.
+                # Only add to local_binders when NOT global/nonlocal —
+                # those are checked after both passes.
+                if isinstance(n, ast.Assign):
+                    for tgt in n.targets:
+                        for name in _names_in_target(tgt):
+                            local_binders.add(name)
+                elif isinstance(n, ast.AnnAssign):
+                    for name in _names_in_target(n.target):
+                        local_binders.add(name)
+                elif isinstance(n, ast.AugAssign):
+                    for name in _names_in_target(n.target):
+                        local_binders.add(name)
+            elif isinstance(n, ast.For):
+                for name in _names_in_target(n.target):
+                    local_binders.add(name)
+                worklist_pass1.extend(n.body)
+                worklist_pass1.extend(n.orelse)
+                continue
+            elif isinstance(n, ast.With):
+                for item in n.items:
+                    if item.optional_vars is not None:
+                        for name in _names_in_target(item.optional_vars):
+                            local_binders.add(name)
+                worklist_pass1.extend(n.body)
+                continue
+            elif isinstance(n, ast.ExceptHandler):
+                if n.name:
+                    local_binders.add(n.name)
+            # Comprehension targets
+            elif isinstance(n, (ast.ListComp, ast.SetComp, ast.GeneratorExp,
+                                 ast.DictComp)):
+                continue  # skip comprehension internals entirely
+            worklist_pass1.extend(ast.iter_child_nodes(n))
+
+        # global/nonlocal names are never treated as pure locals
+        local_binders -= global_decls
+        local_binders -= nonlocal_decls
+        # import bindings are local but handled separately
+        local_binders -= import_bindings
+
+        # --- Pass 2: emit observations
+        # Parameters → param
+        for arg in (
+            list(params.args)
+            + list(params.posonlyargs)
+            + list(params.kwonlyargs)
+            + ([params.vararg] if params.vararg else [])
+            + ([params.kwarg] if params.kwarg else [])
+        ):
+            result.append((
+                arg.arg, "param", "param",
+                arg.lineno, getattr(arg, "end_lineno", arg.lineno),
+            ))
+
+        # Body walk for declarations, imports, reads, and global/nonlocal
+        # writes/deletes
+        worklist_pass2: list = list(node.body)
+        while worklist_pass2:
+            n = worklist_pass2.pop()
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue  # nested entity boundary
+
+            if isinstance(n, ast.Global):
+                for name in n.names:
+                    result.append((
+                        name, "global_decl", "global",
+                        n.lineno, getattr(n, "end_lineno", n.lineno),
+                    ))
+                # don't recurse — no child nodes of interest on Global
+                continue
+
+            if isinstance(n, ast.Nonlocal):
+                for name in n.names:
+                    result.append((
+                        name, "nonlocal_decl", "nonlocal",
+                        n.lineno, getattr(n, "end_lineno", n.lineno),
+                    ))
+                continue
+
+            if isinstance(n, (ast.Import, ast.ImportFrom)):
+                for alias in n.names:
+                    bound_name = alias.asname if alias.asname else (
+                        alias.name.split(".")[0]
+                    )
+                    result.append((
+                        bound_name, "import_write", "import",
+                        n.lineno, getattr(n, "end_lineno", n.lineno),
+                    ))
+                continue  # don't walk into import sub-nodes
+
+            if isinstance(n, (ast.Assign, ast.AugAssign)):
+                # Only persist writes to global/nonlocal targets
+                targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+                for tgt in targets:
+                    if isinstance(tgt, ast.Name):
+                        nm = tgt.id
+                        if nm in global_decls:
+                            result.append((
+                                nm, "global_write", "global",
+                                n.lineno, getattr(n, "end_lineno", n.lineno),
+                            ))
+                        elif nm in nonlocal_decls:
+                            result.append((
+                                nm, "nonlocal_write", "nonlocal",
+                                n.lineno, getattr(n, "end_lineno", n.lineno),
+                            ))
+                # Fall through to recurse on the value expression
+
+            if isinstance(n, ast.Delete):
+                for tgt in n.targets:
+                    if isinstance(tgt, ast.Name):
+                        nm = tgt.id
+                        if nm in global_decls:
+                            result.append((
+                                nm, "global_delete", "global",
+                                n.lineno, getattr(n, "end_lineno", n.lineno),
+                            ))
+                        elif nm in nonlocal_decls:
+                            result.append((
+                                nm, "nonlocal_delete", "nonlocal",
+                                n.lineno, getattr(n, "end_lineno", n.lineno),
+                            ))
+
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+                nm = n.id
+                # Skip names that are purely local binders or import bindings
+                if nm in local_binders or nm in import_bindings:
+                    pass  # local — suppress
+                elif nm in global_decls:
+                    result.append((
+                        nm, "external_read", "global",
+                        n.lineno, getattr(n, "end_lineno", n.lineno),
+                    ))
+                elif nm in nonlocal_decls:
+                    result.append((
+                        nm, "external_read", "nonlocal",
+                        n.lineno, getattr(n, "end_lineno", n.lineno),
+                    ))
+                else:
+                    result.append((
+                        nm, "external_read", "external_or_unknown",
+                        n.lineno, getattr(n, "end_lineno", n.lineno),
+                    ))
+                continue  # Name has no child nodes worth visiting
+
+            worklist_pass2.extend(ast.iter_child_nodes(n))
+
+        return result
 
 
 class CodeScanner:
@@ -2104,6 +2429,19 @@ class CodeScanner:
                         call["start_line"],
                         call["end_line"],
                         call["confidence"],
+                    )
+
+                for sym in rec.get("symbols", []):
+                    db.insert_symbol_observation(
+                        entity_id,
+                        source_file_id,
+                        scan_run_id,
+                        sym["symbol_name"],
+                        sym["access_kind"],
+                        sym["scope_hint"],
+                        sym["start_line"],
+                        sym["end_line"],
+                        sym["confidence"],
                     )
 
                 for text_kind, text_body in rec.get("texts", []):

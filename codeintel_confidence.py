@@ -1265,6 +1265,177 @@ def test_sql_extractor_scope() -> None:
 
 
 # ---------------------------------------------------------------------------
+# O. Python external symbol observations
+# ---------------------------------------------------------------------------
+
+
+def test_external_symbol_observations() -> None:
+    print("\nO. Python external symbol observations")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+
+        src = textwrap.dedent("""\
+            # symbols.py
+
+            def load(path):
+                raw = Path(path).read_text()
+                data = json.loads(raw)
+                logger.info("loaded")
+                return data
+
+            def reset():
+                global CACHE
+                CACHE = {}
+
+            def outer():
+                count = 0
+                def inc():
+                    nonlocal count
+                    count += 1
+                    return count
+
+            def use_imports():
+                import os
+                from pathlib import Path
+                return os.name, Path("x")
+
+            def process(items, path):
+                for item in items:
+                    logger.info(item)
+                with open(path) as fh:
+                    text = fh.read()
+                try:
+                    risky()
+                except Exception as exc:
+                    logger.warning(exc)
+        """)
+        (tmp / "symbols.py").write_text(src, encoding="utf-8")
+        res = run_ci(["scan", "symbols.py"], tmp)
+        _assert("O: scan exits 0", res.returncode == 0, res.stderr)
+
+        def _sym(qname_like, symbol_name, access_kind):
+            return q1(
+                tmp,
+                "SELECT 1 FROM v_symbol_observation_current "
+                "WHERE owner_qualified_name LIKE ? "
+                "AND symbol_name = ? AND access_kind = ?",
+                (qname_like, symbol_name, access_kind),
+            )
+
+        def _no_sym(qname_like, symbol_name):
+            return q1(
+                tmp,
+                "SELECT 1 FROM v_symbol_observation_current "
+                "WHERE owner_qualified_name LIKE ? AND symbol_name = ?",
+                (qname_like, symbol_name),
+            ) is None
+
+        # --- O1: external reads, locals suppressed
+        _assert("O1: path/param",   _sym("%.load", "path", "param") is not None)
+        _assert("O1: Path/ext",     _sym("%.load", "Path", "external_read") is not None)
+        _assert("O1: json/ext",     _sym("%.load", "json", "external_read") is not None)
+        _assert("O1: logger/ext",   _sym("%.load", "logger", "external_read") is not None)
+        _assert("O1: raw NOT persisted",  _no_sym("%.load", "raw"))
+        _assert("O1: data NOT persisted", _no_sym("%.load", "data"))
+
+        # --- O2: global declaration and global write
+        _assert("O2: CACHE/global_decl",  _sym("%.reset", "CACHE", "global_decl") is not None)
+        _assert("O2: CACHE/global_write", _sym("%.reset", "CACHE", "global_write") is not None)
+
+        # --- O3: nonlocal declaration and nonlocal write
+        _assert("O3: count/nonlocal_decl",  _sym("%.outer.inc", "count", "nonlocal_decl") is not None)
+        _assert("O3: count/nonlocal_write", _sym("%.outer.inc", "count", "nonlocal_write") is not None)
+        # ordinary local 'count' in outer must not be persisted as a symbol observation
+        # (count is a plain assignment, not global/nonlocal from outer's perspective)
+        _assert("O3: count in outer NOT persisted as external_read",
+                q1(tmp,
+                   "SELECT 1 FROM v_symbol_observation_current "
+                   "WHERE owner_qualified_name LIKE '%.outer' "
+                   "AND symbol_name='count' AND access_kind='external_read'",
+                ) is None)
+
+        # --- O4: function-local imports
+        _assert("O4: os/import_write",   _sym("%.use_imports", "os",   "import_write") is not None)
+        _assert("O4: Path/import_write", _sym("%.use_imports", "Path", "import_write") is not None)
+        # import-bound names must NOT be duplicated as external_read
+        _assert("O4: os NOT external_read",   _sym("%.use_imports", "os",   "external_read") is None)
+        _assert("O4: Path NOT external_read", _sym("%.use_imports", "Path", "external_read") is None)
+
+        # --- O5: loop/with/except locals suppressed
+        _assert("O5: items/param",      _sym("%.process", "items", "param") is not None)
+        _assert("O5: path/param",       _sym("%.process", "path",  "param") is not None)
+        _assert("O5: logger/ext",       _sym("%.process", "logger",    "external_read") is not None)
+        _assert("O5: open/ext",         _sym("%.process", "open",      "external_read") is not None)
+        _assert("O5: risky/ext",        _sym("%.process", "risky",     "external_read") is not None)
+        _assert("O5: Exception/ext",    _sym("%.process", "Exception", "external_read") is not None)
+        _assert("O5: item NOT persisted",  _no_sym("%.process", "item"))
+        _assert("O5: fh NOT persisted",   _no_sym("%.process", "fh"))
+        _assert("O5: text NOT persisted", _no_sym("%.process", "text"))
+        _assert("O5: exc NOT persisted",  _no_sym("%.process", "exc"))
+
+        # --- O7: only function-like entities produce symbol observations
+        rows = qall(
+            tmp,
+            "SELECT DISTINCT owner_entity_type FROM v_symbol_observation_current",
+        )
+        non_fn = [
+            r["owner_entity_type"]
+            for r in rows
+            if r["owner_entity_type"] not in (
+                "python_function", "python_method", "python_nested_function"
+            )
+        ]
+        _assert("O7: only function-like entities produce symbol observations",
+                non_fn == [], f"unexpected types: {non_fn}")
+
+    # --- O6: current view shows new symbol after rescan, old symbol gone
+    with tempfile.TemporaryDirectory() as td2:
+        tmp2 = Path(td2)
+        (tmp2 / "evo.py").write_text(
+            "def run():\n    ext_alpha()\n", encoding="utf-8"
+        )
+        run_ci(["scan", "evo.py"], tmp2)
+
+        row_before = q1(
+            tmp2,
+            "SELECT 1 FROM v_symbol_observation_current "
+            "WHERE owner_qualified_name LIKE '%.run' AND symbol_name='ext_alpha'",
+        )
+        _assert("O6: current view shows ext_alpha before rescan", row_before is not None)
+
+        (tmp2 / "evo.py").write_text(
+            "def run():\n    ext_beta()\n", encoding="utf-8"
+        )
+        run_ci(["scan", "evo.py"], tmp2)
+
+        row_old = q1(
+            tmp2,
+            "SELECT 1 FROM v_symbol_observation_current "
+            "WHERE owner_qualified_name LIKE '%.run' AND symbol_name='ext_alpha'",
+        )
+        _assert("O6: ext_alpha absent from current view after rescan", row_old is None)
+
+        row_new = q1(
+            tmp2,
+            "SELECT 1 FROM v_symbol_observation_current "
+            "WHERE owner_qualified_name LIKE '%.run' AND symbol_name='ext_beta'",
+        )
+        _assert("O6: ext_beta present in current view after rescan", row_new is not None)
+
+        rows_all = qall(
+            tmp2,
+            "SELECT symbol_name FROM v_symbol_observation "
+            "WHERE owner_qualified_name LIKE '%.run' "
+            "AND access_kind = 'external_read' ORDER BY symbol_name",
+        )
+        all_names = {r["symbol_name"] for r in rows_all}
+        _assert("O6: v_symbol_observation retains ext_alpha historically",
+                "ext_alpha" in all_names)
+        _assert("O6: v_symbol_observation retains ext_beta historically",
+                "ext_beta" in all_names)
+
+
+# ---------------------------------------------------------------------------
 
 
 def main() -> None:
@@ -1286,6 +1457,7 @@ def main() -> None:
     test_call_observations()
     test_validate_source_path_semantics()
     test_sql_extractor_scope()
+    test_external_symbol_observations()
 
     total  = len(_results)
     passed = sum(1 for _, ok, _ in _results if ok)

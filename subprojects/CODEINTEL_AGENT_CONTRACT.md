@@ -144,3 +144,24 @@ general SQL parser.  Agents may use it to locate simple
 columns, but must read SQL source directly before editing or reasoning about
 complete SQL semantics.  Unsupported SQL constructs (triggers, stored
 procedures, DML, vendor-specific syntax) may be ignored rather than modelled.
+
+## 12. External symbol observations
+
+CodeIntel records a deliberately narrow set of Python symbol observations in
+`symbol_observation`, readable via:
+
+- `v_symbol_observation_current` — use this for current orientation;
+- `v_symbol_observation` — full cross-scan history.
+
+This feature is designed for token efficiency.  It records interface and
+external-coupling signals that may help agents avoid broad source reads.
+
+In this version, symbol observations include parameters, explicit global and
+nonlocal declarations, function-local imports, reads of names not locally bound
+in the function, and writes/deletes to explicitly declared global/nonlocal
+names.
+
+Ordinary local variable traffic is intentionally not recorded.  Local binders
+may be collected internally only to suppress noise.  Agents must still read
+source before editing or reasoning about implementation details, local
+dataflow, or runtime binding semantics.
