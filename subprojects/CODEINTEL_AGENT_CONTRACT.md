@@ -135,3 +135,12 @@ Agent guidance:
 - do **not** assume a call observation proves that a specific callee entity
   is always invoked at runtime;
 - always read source before editing call behaviour.
+
+## 11. SQL extractor scope
+
+The SQL extractor is a lightweight SQLite DDL orientation extractor, not a
+general SQL parser.  Agents may use it to locate simple
+`CREATE TABLE` / `CREATE VIEW` / `CREATE INDEX` objects and simple table
+columns, but must read SQL source directly before editing or reasoning about
+complete SQL semantics.  Unsupported SQL constructs (triggers, stored
+procedures, DML, vendor-specific syntax) may be ignored rather than modelled.

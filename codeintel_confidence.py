@@ -1122,6 +1122,149 @@ def test_call_observations() -> None:
 
 
 # ---------------------------------------------------------------------------
+# M. validate-source path/root semantics
+# ---------------------------------------------------------------------------
+
+
+def test_validate_source_path_semantics() -> None:
+    print("\nM. validate-source path/root semantics")
+
+    # M1 — non-git directory scan: validate-source resolves correctly
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        (tmp / "hello.py").write_text("def greet(): pass\n", encoding="utf-8")
+        run_ci(["scan", str(tmp)], tmp)
+        r = run_ci(["validate-source", str(tmp / "hello.py")], tmp)
+        _assert("M1: validate-source exits 0 (non-git dir)",
+                r.returncode == 0, r.stderr.strip())
+        _assert("M1: validate-source reports CLEAN (non-git dir)",
+                "[CLEAN]" in r.stdout, r.stdout.strip())
+
+    # M2 — non-git single-file scan: validate-source resolves correctly
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        (tmp / "single.py").write_text("def only(): pass\n", encoding="utf-8")
+        run_ci(["scan", str(tmp / "single.py")], tmp)
+        r = run_ci(["validate-source", str(tmp / "single.py")], tmp)
+        _assert("M2: validate-source exits 0 (non-git single file)",
+                r.returncode == 0, r.stderr.strip())
+        _assert("M2: validate-source reports CLEAN (non-git single file)",
+                "[CLEAN]" in r.stdout, r.stdout.strip())
+
+    # M3 — git repo root scan: validate-source resolves repo-relative path
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        (tmp / ".git").mkdir()
+        pkg = tmp / "pkg"
+        pkg.mkdir()
+        (pkg / "mod.py").write_text("def func(): pass\n", encoding="utf-8")
+        run_ci(["scan", str(tmp)], tmp)
+        r = run_ci(["validate-source", str(pkg / "mod.py")], tmp)
+        _assert("M3: validate-source exits 0 (git repo root scan)",
+                r.returncode == 0, r.stderr.strip())
+        _assert("M3: validate-source reports CLEAN (git repo root scan)",
+                "[CLEAN]" in r.stdout, r.stdout.strip())
+
+    # M4 — git subdirectory scan: file path stored relative to git root;
+    #      validate-source of the same file should still resolve
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        (tmp / ".git").mkdir()
+        pkg = tmp / "pkg"
+        pkg.mkdir()
+        other = tmp / "other"
+        other.mkdir()
+        (pkg / "mod.py").write_text("def func(): pass\n", encoding="utf-8")
+        (other / "outside.py").write_text("def ext(): pass\n", encoding="utf-8")
+        # scan only the subdirectory
+        run_ci(["scan", str(pkg)], tmp)
+        r = run_ci(["validate-source", str(pkg / "mod.py")], tmp)
+        _assert("M4: validate-source exits 0 (git subdir scan)",
+                r.returncode == 0, r.stderr.strip())
+        _assert("M4: validate-source reports CLEAN (git subdir scan)",
+                "[CLEAN]" in r.stdout, r.stdout.strip())
+
+        # M5 — file outside the scanned subdirectory should not be in DB
+        r5 = run_ci(["validate-source", str(other / "outside.py")], tmp)
+        _assert("M5: validate-source exits 0 even for unknown file",
+                r5.returncode == 0, r5.stderr.strip())
+        # Report must indicate the file is not known (db_file_not_found issue)
+        _assert("M5: validate-source reports file not in DB",
+                "db_file_not_found" in r5.stdout or "not found in DB" in r5.stdout
+                or "[DRIFT]" in r5.stdout,
+                r5.stdout.strip())
+
+
+# ---------------------------------------------------------------------------
+# N. SQL extractor scope contract
+# ---------------------------------------------------------------------------
+
+
+def test_sql_extractor_scope() -> None:
+    print("\nN. SQL extractor scope contract")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+
+        # N1 — supported lightweight SQLite DDL syntax
+        (tmp / "schema.sql").write_text(
+            textwrap.dedent("""\
+                CREATE TABLE users (
+                    id   INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL
+                );
+
+                CREATE VIEW active_users AS
+                SELECT id, name FROM users;
+
+                CREATE UNIQUE INDEX idx_users_name ON users(name);
+            """),
+            encoding="utf-8",
+        )
+        run_ci(["scan", "schema.sql"], tmp)
+
+        def _entity(qname: str, etype: str) -> bool:
+            row = q1(tmp,
+                "SELECT entity_type FROM v_entity_current WHERE qualified_name = ?",
+                (qname,))
+            return row is not None and row["entity_type"] == etype
+
+        _assert("N1: sql_table users extracted",
+                _entity("schema.users", "sql_table"))
+        _assert("N1: sql_column users.id extracted",
+                _entity("schema.users.id", "sql_column"))
+        _assert("N1: sql_column users.name extracted",
+                _entity("schema.users.name", "sql_column"))
+        _assert("N1: sql_view active_users extracted",
+                _entity("schema.active_users", "sql_view"))
+        _assert("N1: sql_index idx_users_name extracted",
+                _entity("schema.idx_users_name", "sql_index"))
+
+    # N2 — unsupported SQL syntax (TRIGGER) is not modelled
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        (tmp / "trigger.sql").write_text(
+            textwrap.dedent("""\
+                CREATE TRIGGER trg_users_update
+                AFTER UPDATE ON users
+                BEGIN
+                    SELECT 1;
+                END;
+            """),
+            encoding="utf-8",
+        )
+        run_ci(["scan", "trigger.sql"], tmp)
+
+        no_trigger_type = q1(tmp,
+            "SELECT 1 FROM v_entity_current WHERE entity_type = 'sql_trigger'")
+        _assert("N2: no sql_trigger entity produced", no_trigger_type is None)
+
+        no_trigger_name = q1(tmp,
+            "SELECT 1 FROM v_entity_current "
+            "WHERE qualified_name LIKE '%.trg_users_update'")
+        _assert("N2: no entity named trg_users_update produced", no_trigger_name is None)
+
+
+# ---------------------------------------------------------------------------
 
 
 def main() -> None:
@@ -1141,6 +1284,8 @@ def main() -> None:
     test_path_root_semantics()
     test_ast_transparent_containers()
     test_call_observations()
+    test_validate_source_path_semantics()
+    test_sql_extractor_scope()
 
     total  = len(_results)
     passed = sum(1 for _, ok, _ in _results if ok)

@@ -1494,9 +1494,23 @@ class LanguageExtractor:
 
 class SqlSchemaExtractor(LanguageExtractor):
     """
-    Extract sql_table, sql_view, sql_index, and sql_column entities from
+    Lightweight SQLite DDL orientation extractor, not a general SQL parser.
+
+    Extracts sql_table, sql_view, sql_index, and sql_column entities from
     .sql files using a line-by-line state machine with regex matching on
     CREATE TABLE / VIEW / INDEX statements.
+
+    Supported constructs:
+        CREATE TABLE <name> (...)  → sql_table + sql_column entities
+        CREATE VIEW <name> AS ...  → sql_view entity
+        CREATE [UNIQUE] INDEX <name> ON <table> (...) → sql_index entity
+
+    Unsupported constructs (silently ignored, not modelled):
+        triggers, stored procedures, DML, complex generated columns,
+        vendor-specific dialects.
+
+    Agents must read SQL source directly before editing or reasoning about
+    complete SQL semantics.
 
     detection_method = 'sql_schema_regex'
     """
