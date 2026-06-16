@@ -129,8 +129,9 @@ What call observations are **not**:
   call observations.
 
 Agent guidance:
-- use `v_call_observation` to **narrow** which source functions to read
+- use `v_call_observation_current` to **narrow** which source functions to read
   before editing call sites;
+- use `v_call_observation` only when cross-scan history is needed;
 - do **not** assume a call observation proves that a specific callee entity
   is always invoked at runtime;
 - always read source before editing call behaviour.
