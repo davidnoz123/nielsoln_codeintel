@@ -4057,8 +4057,18 @@ class TextCallableCommand:
     live callable and does not execute code.
 
     Fields are populated from ``v_text_callable_current`` rows at registry
-    load time.  A future phase may add ``invoke()`` — leave room by keeping
-    the dataclass open.
+    load time via ``from_row()``.  A future phase may add ``invoke()`` —
+    leave room by keeping the dataclass open.
+
+    Command naming note
+    -------------------
+    ``command_name`` is currently the bare function name (last dotted segment
+    of ``qualified_name``).  This is sufficient for single-repo use, but
+    future multi-repo deployments may expose two functions with the same bare
+    name from different repos (e.g. both have a "scan" function).  A future
+    phase should add repo-qualified lookup (e.g. ``<repo>/<command_name>``)
+    to ``find()``.  The ``repo_name`` field is already present to support
+    this.
     """
 
     command_name: str           # short name derived from the function name
@@ -4077,6 +4087,60 @@ class TextCallableCommand:
     review_note: Optional[str]
     reviewed_by: Optional[str]
     reviewed_at: str
+
+    # ------------------------------------------------------------------
+    # Construction
+
+    @classmethod
+    def from_row(cls, row: object) -> "TextCallableCommand":
+        """
+        Materialise a TextCallableCommand from a self-contained DB row.
+
+        The row must come from the registry's loading query which JOINs
+        ``entity_text`` and ``git_repo`` so that docstring and repo metadata
+        are available without any secondary ``entity_id`` lookup.
+
+        Accepts a sqlite3.Row, a dict, or any object supporting ``row[key]``
+        or ``getattr(row, key)`` access.
+        """
+        def g(key: str, default: object = None) -> object:
+            if isinstance(row, dict):
+                return row.get(key, default)
+            try:
+                return row[key]  # type: ignore[index]
+            except (KeyError, IndexError, TypeError):
+                pass
+            return getattr(row, key, default)
+
+        qname: str = str(g("qualified_name") or "")
+        command_name = qname.rsplit(".", 1)[-1] if "." in qname else qname
+
+        # Docstring fields come directly from the row (self-contained).
+        docstring_text: str = str(g("docstring_text") or "")
+        first_para = docstring_text.split("\n\n")[0].strip()
+        summary = first_para.splitlines()[0].strip() if first_para else ""
+
+        return cls(
+            command_name   = command_name,
+            entity_id      = int(g("entity_id") or 0),
+            qualified_name = qname,
+            callable_kind  = str(g("entity_type") or ""),
+            summary        = summary,
+            description    = docstring_text,
+            arg_spec       = [],   # populated by AI review in a future phase
+            return_spec    = {"type": "text", "description": ""},
+            repo_name      = str(g("repo_name") or ""),
+            repo_root      = str(g("repo_root") or ""),
+            file_path      = str(g("file_path") or ""),
+            start_line     = g("start_line"),
+            end_line       = g("end_line"),
+            review_note    = g("review_note"),
+            reviewed_by    = g("reviewed_by"),
+            reviewed_at    = str(g("reviewed_at") or ""),
+        )
+
+    # ------------------------------------------------------------------
+    # Serialisation
 
     def to_dict(self) -> Dict[str, Any]:
         """Return a JSON-serialisable dict suitable for MCP tool descriptions."""
@@ -4106,6 +4170,8 @@ class TextCallableCommand:
             f"qualified_name: {self.qualified_name}",
             f"kind          : {self.callable_kind}",
         ]
+        if self.repo_name:
+            lines.append(f"repo          : {self.repo_name}")
         if self.summary:
             lines.append(f"summary       : {self.summary}")
         if self.description and self.description != self.summary:
@@ -4138,37 +4204,63 @@ class TextCallableArgumentCoercer:
     """
     Convert text (or already-typed) inputs into Python values.
 
-    Supported target types: str, int, float, bool, list, dict.
-    For list/dict the input is parsed as JSON.
+    Supported target type names (case-insensitive)::
 
-    Keep this intentionally small — do not overbuild.
+        str / string
+        int / integer
+        float
+        bool / boolean
+        list / array
+        dict / object / json
+
+    An unknown type name raises ``ValueError`` — there is no silent fallback.
     """
+
+    # Canonical name → handler key mapping.
+    _ALIASES: Dict[str, str] = {
+        "str":     "str",
+        "string":  "str",
+        "int":     "int",
+        "integer": "int",
+        "float":   "float",
+        "bool":    "bool",
+        "boolean": "bool",
+        "list":    "list",
+        "array":   "list",
+        "dict":    "dict",
+        "object":  "dict",
+        "json":    "dict",
+    }
 
     def coerce(self, value: object, target_type: str) -> object:
         """
         Coerce *value* to *target_type*.
 
-        *target_type* is a lowercase string: ``'str'``, ``'int'``,
-        ``'float'``, ``'bool'``, ``'list'``, ``'dict'``.
-
-        Raises ``ValueError`` on conversion failure.
+        Raises ``ValueError`` for unknown type names or conversion failures.
         """
-        t = (target_type or "str").strip().lower()
+        raw_type = (target_type or "").strip().lower()
+        canonical = self._ALIASES.get(raw_type)
+        if canonical is None:
+            raise ValueError(
+                f"unknown target type {target_type!r}. "
+                f"Supported: {', '.join(sorted(self._ALIASES))}"
+            )
+
         raw = str(value) if not isinstance(value, str) else value
 
-        if t == "str":
+        if canonical == "str":
             return raw
-        if t == "int":
+        if canonical == "int":
             try:
                 return int(raw)
             except (ValueError, TypeError):
                 raise ValueError(f"cannot coerce {raw!r} to int")
-        if t == "float":
+        if canonical == "float":
             try:
                 return float(raw)
             except (ValueError, TypeError):
                 raise ValueError(f"cannot coerce {raw!r} to float")
-        if t == "bool":
+        if canonical == "bool":
             if isinstance(value, bool):
                 return value
             if raw.strip().lower() in ("1", "true", "yes", "y", "on"):
@@ -4176,10 +4268,10 @@ class TextCallableArgumentCoercer:
             if raw.strip().lower() in ("0", "false", "no", "n", "off"):
                 return False
             raise ValueError(f"cannot coerce {raw!r} to bool")
-        if t in ("list", "dict"):
+        if canonical in ("list", "dict"):
             return self.coerce_json(raw)
-        # Unknown type — pass through as string.
-        return raw
+        # Should be unreachable, but be explicit.
+        raise ValueError(f"internal error: unhandled canonical type {canonical!r}")
 
     def coerce_json(self, text: str) -> object:
         """Parse *text* as JSON and return the result."""
@@ -4207,9 +4299,44 @@ class TextCallableCommandRegistry:
     access.  Both ``CodeIndexDb`` and ``CodeIntelDbUnionConnection`` satisfy
     this contract.  A raw ``sqlite3.Connection`` is also accepted.
 
+    Each row returned by the loading query is **self-contained**: docstring
+    text and repo metadata are obtained via SQL JOINs in the same query, so
+    no secondary ``entity_id`` lookup is required.  This makes the registry
+    safe to use with ``CodeIntelDbUnionConnection`` where ``entity_id`` is
+    not globally unique across repos.
+
     Design note: ``invoke()`` is intentionally absent.  A future phase will
     add execution, dispatch, and MCP exposure.
+
+    Command naming note
+    -------------------
+    ``find()`` currently matches on ``command_name`` (bare function name) and
+    ``qualified_name``.  In a future multi-repo deployment two repos may both
+    expose the same ``command_name``.  A repo-qualified lookup key will be
+    needed; see ``TextCallableCommand`` for discussion.
     """
+
+    # SQL that produces self-contained rows — no secondary lookups needed.
+    # Joins entity_text for docstring and git_repo for repo metadata.
+    # Works against a single CodeIndexDb or through CodeIntelDbUnionConnection
+    # (which runs the query per-repo and merges results in Python).
+    _LOAD_SQL = (
+        "SELECT vtc.review_id, vtc.entity_id, vtc.qualified_name, vtc.name, "
+        "       vtc.entity_type, vtc.file_path, vtc.start_line, vtc.end_line, "
+        "       vtc.language, vtc.docstring_status, vtc.arg_textish_status, "
+        "       vtc.return_textish_status, vtc.exposure_status, "
+        "       vtc.review_note, vtc.reviewed_by, vtc.reviewed_at, "
+        "       COALESCE(et.text_body, '') AS docstring_text, "
+        "       COALESCE(gr.repo_slug, '') AS repo_name, "
+        "       COALESCE(gr.root_path, '') AS repo_root "
+        "FROM v_text_callable_current vtc "
+        "LEFT JOIN entity_text et "
+        "       ON et.entity_id = vtc.entity_id AND et.text_kind = 'docstring' "
+        "LEFT JOIN code_entity ce ON ce.id = vtc.entity_id "
+        "LEFT JOIN git_branch gb  ON gb.id = ce.branch_id "
+        "LEFT JOIN git_repo gr    ON gr.id = gb.repo_id "
+        "ORDER BY vtc.qualified_name"
+    )
 
     def __init__(self, db: object) -> None:
         self._db = db
@@ -4253,87 +4380,21 @@ class TextCallableCommandRegistry:
     # ------------------------------------------------------------------
     # Private
 
-    def _query(self, sql: str, params: tuple = ()) -> list:
+    def _query(self, sql: str, params: object = ()) -> list:
         db = self._db
         # CodeIndexDb / CodeIntelDbUnionConnection
         if hasattr(db, "query"):
             return db.query(sql, params)
         # Raw sqlite3.Connection
         if hasattr(db, "execute"):
-            db.row_factory = sqlite3.Row  # type: ignore[union-attr]
-            return db.execute(sql, params).fetchall()  # type: ignore[union-attr]
+            cur = db.execute(sql, params)  # type: ignore[union-attr]
+            cur.row_factory = sqlite3.Row
+            return cur.fetchall()
         raise TypeError(f"unsupported db type: {type(db)!r}")
 
-    @staticmethod
-    def _row_get(row: object, key: str, default: object = None) -> object:
-        """Read a column from a sqlite3.Row, dict, or object."""
-        if isinstance(row, dict):
-            return row.get(key, default)
-        try:
-            return row[key]  # type: ignore[index]
-        except (KeyError, IndexError):
-            pass
-        return getattr(row, key, default)
-
     def _load(self) -> List[TextCallableCommand]:
-        rows = self._query(
-            "SELECT review_id, entity_id, qualified_name, name, entity_type, "
-            "       file_path, start_line, end_line, language, "
-            "       docstring_status, arg_textish_status, return_textish_status, "
-            "       exposure_status, review_note, reviewed_by, reviewed_at "
-            "FROM v_text_callable_current "
-            "ORDER BY qualified_name"
-        )
-
-        commands: List[TextCallableCommand] = []
-        for row in rows:
-            g = lambda k, d=None: self._row_get(row, k, d)  # noqa: E731
-
-            qname: str = g("qualified_name") or ""
-            # command_name is the last dotted segment (the bare function name)
-            command_name = qname.rsplit(".", 1)[-1] if "." in qname else qname
-
-            # Resolve docstring from entity_text if available
-            summary, description = self._resolve_docstring(g("entity_id"))
-
-            commands.append(TextCallableCommand(
-                command_name   = command_name,
-                entity_id      = int(g("entity_id") or 0),
-                qualified_name = qname,
-                callable_kind  = str(g("entity_type") or ""),
-                summary        = summary,
-                description    = description,
-                arg_spec       = [],   # populated by AI review in a future phase
-                return_spec    = {"type": "text", "description": ""},
-                repo_name      = "",   # not surfaced by v_text_callable_current
-                repo_root      = "",
-                file_path      = str(g("file_path") or ""),
-                start_line     = g("start_line"),
-                end_line       = g("end_line"),
-                review_note    = g("review_note"),
-                reviewed_by    = g("reviewed_by"),
-                reviewed_at    = str(g("reviewed_at") or ""),
-            ))
-        return commands
-
-    def _resolve_docstring(self, entity_id: object) -> tuple:
-        """Return (summary, full_description) from entity_text, or ('', '')."""
-        if entity_id is None:
-            return "", ""
-        try:
-            rows = self._query(
-                "SELECT text_body FROM entity_text "
-                "WHERE entity_id = ? AND text_kind = 'docstring'",
-                (entity_id,),
-            )
-        except Exception:
-            return "", ""
-        if not rows:
-            return "", ""
-        body: str = str(self._row_get(rows[0], "text_body") or "")
-        first_para = body.split("\n\n")[0].strip()
-        first_line = first_para.splitlines()[0].strip() if first_para else ""
-        return first_line, body
+        rows = self._query(self._LOAD_SQL)
+        return [TextCallableCommand.from_row(row) for row in rows]
 
 
 # ---------------------------------------------------------------------------
