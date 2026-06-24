@@ -1506,26 +1506,40 @@ def test_text_callable_review() -> None:
         # ------------------------------------------------------------------
         # Helpers for the remaining tests
 
-        def _entity_body_hash(qname: str):
-            """Return (entity_id, body_sha256) for a qualified name, or (None, None)."""
+        def _entity_hashes(qname: str):
+            """Return (entity_id, body_sha256, signature_sha256) or (None, None, None)."""
             row = q1(tmp,
                 "SELECT entity_id FROM v_text_callable_candidate "
                 "WHERE qualified_name = ?", (qname,))
             if row is None:
-                return None, None
+                return None, None, None
             eid = row["entity_id"]
-            hash_row = q1(tmp,
+            body_row = q1(tmp,
                 "SELECT hash_value FROM entity_hash "
                 "WHERE entity_id = ? AND hash_kind = 'body_sha256' "
                 "ORDER BY scan_run_id DESC LIMIT 1",
                 (eid,))
-            return eid, (hash_row["hash_value"] if hash_row else None)
+            sig_row = q1(tmp,
+                "SELECT hash_value FROM entity_hash "
+                "WHERE entity_id = ? AND hash_kind = 'signature_sha256' "
+                "ORDER BY scan_run_id DESC LIMIT 1",
+                (eid,))
+            return (
+                eid,
+                body_row["hash_value"] if body_row else None,
+                sig_row["hash_value"] if sig_row else None,
+            )
 
         scan_row = q1(tmp, "SELECT id FROM scan_run ORDER BY id DESC LIMIT 1")
         scan_run_id = scan_row["id"] if scan_row else None
         now = "2026-06-24T00:00:00Z"
 
-        def _insert_review(entity_id, body_hash: str, exposure_status: str) -> None:
+        def _insert_review(
+            entity_id,
+            body_hash: str,
+            exposure_status: str,
+            signature_hash: str = "sig-placeholder",
+        ) -> None:
             conn = sqlite3.connect(db_path)
             try:
                 conn.execute(
@@ -1533,30 +1547,35 @@ def test_text_callable_review() -> None:
                     "(entity_id, scan_run_id, signature_hash, body_hash, "
                     " docstring_status, arg_textish_status, return_textish_status, "
                     " exposure_status, review_note, reviewed_by, reviewed_at) "
-                    "VALUES (?, ?, 'sig-placeholder', ?, "
+                    "VALUES (?, ?, ?, ?, "
                     " 'reviewed', 'textish', 'textish', "
                     " ?, NULL, 'test-harness', ?)",
-                    (entity_id, scan_run_id, body_hash, exposure_status, now),
+                    (entity_id, scan_run_id, signature_hash, body_hash,
+                     exposure_status, now),
                 )
                 conn.commit()
             finally:
                 conn.close()
 
-        greet_id,   greet_hash   = _entity_body_hash("textcmd.greet")
-        farewell_id, farewell_hash = _entity_body_hash("textcmd.farewell")
-        welcome_id,  welcome_hash  = _entity_body_hash("textcmd.welcome")
-        sendoff_id,  sendoff_hash  = _entity_body_hash("textcmd.sendoff")
+        # Resolve real hashes for all four test functions
+        greet_id,   greet_body,   greet_sig   = _entity_hashes("textcmd.greet")
+        farewell_id, farewell_body, farewell_sig = _entity_hashes("textcmd.farewell")
+        welcome_id,  welcome_body,  welcome_sig  = _entity_hashes("textcmd.welcome")
+        sendoff_id,  sendoff_body,  sendoff_sig  = _entity_hashes("textcmd.sendoff")
 
         _assert("P: greet entity_id and body_hash resolved",
-            greet_id is not None and greet_hash is not None)
-        if greet_id is None or greet_hash is None:
+            greet_id is not None and greet_body is not None)
+        _assert("P: greet signature_sha256 stored by scanner",
+            greet_sig is not None)
+        if greet_id is None or greet_body is None or greet_sig is None:
             return
 
         # ------------------------------------------------------------------
-        # P3: approved + matching body_hash → appears in v_text_callable_current
+        # P3: approved + matching both hashes → appears in v_text_callable_current
 
-        _insert_review(greet_id, greet_hash, "approved")
-        _assert("P3: approved+matching hash appears in v_text_callable_current",
+        _insert_review(greet_id, greet_body, "approved",
+                       signature_hash=greet_sig)
+        _assert("P3: approved+matching both hashes appears in v_text_callable_current",
             q1(tmp,
                 "SELECT 1 FROM v_text_callable_current "
                 "WHERE qualified_name = 'textcmd.greet'") is not None)
@@ -1564,9 +1583,10 @@ def test_text_callable_review() -> None:
         # ------------------------------------------------------------------
         # P4: approved + mismatched body_hash → absent from v_text_callable_current
 
-        if farewell_id:
-            _insert_review(farewell_id, "wrong-hash-00000000000000000000", "approved")
-            _assert("P4: approved+mismatched hash absent from v_text_callable_current",
+        if farewell_id and farewell_sig:
+            _insert_review(farewell_id, "wrong-body-hash-000000000000000000",
+                           "approved", signature_hash=farewell_sig)
+            _assert("P4: approved+mismatched body hash absent from v_text_callable_current",
                 q1(tmp,
                     "SELECT 1 FROM v_text_callable_current "
                     "WHERE qualified_name = 'textcmd.farewell'") is None)
@@ -1574,8 +1594,9 @@ def test_text_callable_review() -> None:
         # ------------------------------------------------------------------
         # P5: candidate status → hidden from v_text_callable_current
 
-        if welcome_id and welcome_hash:
-            _insert_review(welcome_id, welcome_hash, "candidate")
+        if welcome_id and welcome_body and welcome_sig:
+            _insert_review(welcome_id, welcome_body, "candidate",
+                           signature_hash=welcome_sig)
             _assert("P5: candidate status hidden from v_text_callable_current",
                 q1(tmp,
                     "SELECT 1 FROM v_text_callable_current "
@@ -1584,12 +1605,51 @@ def test_text_callable_review() -> None:
         # ------------------------------------------------------------------
         # P6: rejected status → hidden from v_text_callable_current
 
-        if sendoff_id and sendoff_hash:
-            _insert_review(sendoff_id, sendoff_hash, "rejected")
+        if sendoff_id and sendoff_body and sendoff_sig:
+            _insert_review(sendoff_id, sendoff_body, "rejected",
+                           signature_hash=sendoff_sig)
             _assert("P6: rejected status hidden from v_text_callable_current",
                 q1(tmp,
                     "SELECT 1 FROM v_text_callable_current "
                     "WHERE qualified_name = 'textcmd.sendoff'") is None)
+
+        # ------------------------------------------------------------------
+        # P7: approved + mismatched signature_hash → absent from v_text_callable_current
+        # (body unchanged, but the argument list / annotations changed)
+
+        p7_file = tmp / "p7func.py"
+        p7_file.write_text("def p7func(x: int) -> str:\n    return str(x)\n",
+                            encoding="utf-8")
+        run_ci(["scan", str(tmp)], tmp)
+        p7_id, p7_body, p7_sig = _entity_hashes("p7func.p7func")
+        _assert("P7: p7func entity resolved", p7_id is not None)
+        if p7_id and p7_body and p7_sig:
+            _insert_review(p7_id, p7_body, "approved",
+                           signature_hash="wrong-sig-hash-000000000000000000")
+            _assert("P7: approved+mismatched signature hash absent from v_text_callable_current",
+                q1(tmp,
+                    "SELECT 1 FROM v_text_callable_current "
+                    "WHERE qualified_name = 'p7func.p7func'") is None)
+
+        # ------------------------------------------------------------------
+        # P8: approved + both hashes matching → appears in v_text_callable_current
+        # Explicit companion to P7; also validates that the scanner emits
+        # signature_sha256 correctly and the view joins on it.
+
+        p8_file = tmp / "p8func.py"
+        p8_file.write_text("def p8func(name: str) -> str:\n    return name\n",
+                            encoding="utf-8")
+        run_ci(["scan", str(tmp)], tmp)
+        p8_id, p8_body, p8_sig = _entity_hashes("p8func.p8func")
+        _assert("P8: p8func entity resolved", p8_id is not None)
+        _assert("P8: p8func signature_sha256 stored", p8_sig is not None)
+        if p8_id and p8_body and p8_sig:
+            _insert_review(p8_id, p8_body, "approved",
+                           signature_hash=p8_sig)
+            _assert("P8: approved+both hashes matching appears in v_text_callable_current",
+                q1(tmp,
+                    "SELECT 1 FROM v_text_callable_current "
+                    "WHERE qualified_name = 'p8func.p8func'") is not None)
 
 
 # ---------------------------------------------------------------------------

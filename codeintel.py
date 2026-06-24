@@ -1026,6 +1026,14 @@ class CodeIndexDb:
                 "lines from start_line to end_line for Python) used as the "
                 "primary drift-detection hash.",
             ),
+            (
+                "hash_kind:signature_sha256",
+                "SHA-256 of the entity signature text (the full def/class "
+                "header including decorators).  Emitted for Python function-like "
+                "entities.  Used alongside body_sha256 by v_text_callable_current "
+                "to detect stale TextCallable reviews when the argument list, "
+                "parameter types, or return annotation changes.",
+            ),
             # detection_method values
             (
                 "detection_method:sql_schema_regex",
@@ -2451,6 +2459,20 @@ class CodeScanner:
                 new_hash = _hash_text(rec["body_text"])
                 prev_hash = db.get_latest_entity_hash(entity_id, "body_sha256")
                 db.insert_entity_hash(entity_id, scan_run_id, "body_sha256", new_hash)
+
+                # Emit signature_sha256 when the entity has a signature text.
+                # Used by v_text_callable_current to detect that an approval
+                # is stale when the argument list or return type has changed.
+                sig_text = ""
+                for _tk, _tb in rec.get("texts", []):
+                    if _tk == "signature":
+                        sig_text = _tb or ""
+                        break
+                if sig_text:
+                    db.insert_entity_hash(
+                        entity_id, scan_run_id, "signature_sha256",
+                        _hash_text(sig_text)
+                    )
 
                 if prev_hash is None:
                     # First observation — always 'added'
