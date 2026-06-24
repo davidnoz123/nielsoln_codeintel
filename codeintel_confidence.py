@@ -1441,6 +1441,158 @@ def test_external_symbol_observations() -> None:
 
 
 # ---------------------------------------------------------------------------
+# P. TextCallable review framework — Phase 1
+# ---------------------------------------------------------------------------
+
+
+def test_text_callable_review() -> None:
+    print("\nP. TextCallable review framework — Phase 1")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        db_path = str(tmp / DB_REL)
+
+        (tmp / "textcmd.py").write_text(textwrap.dedent("""\
+            def greet(name: str) -> str:
+                \"\"\"Greet someone.\"\"\"
+                return f"Hello, {name}"
+
+            def farewell(name: str) -> str:
+                \"\"\"Bid farewell.\"\"\"
+                return f"Goodbye, {name}"
+
+            def welcome(name: str) -> str:
+                \"\"\"Welcome someone.\"\"\"
+                return f"Welcome, {name}"
+
+            def sendoff(name: str) -> str:
+                \"\"\"Send someone off.\"\"\"
+                return f"Farewell, {name}"
+        """), encoding="utf-8")
+
+        r = run_ci(["scan", str(tmp)], tmp)
+        _assert("P: scan exits 0", r.returncode == 0, r.stderr.strip())
+
+        # ------------------------------------------------------------------
+        # P1: schema objects exist after migration
+
+        def _obj_exists(obj_type: str, name: str) -> bool:
+            row = q1(tmp,
+                "SELECT 1 FROM sqlite_master WHERE type = ? AND name = ?",
+                (obj_type, name))
+            return row is not None
+
+        _assert("P1: text_callable_review table exists",
+            _obj_exists("table", "text_callable_review"))
+        _assert("P1: v_text_callable_candidate view exists",
+            _obj_exists("view", "v_text_callable_candidate"))
+        _assert("P1: v_text_callable_current view exists",
+            _obj_exists("view", "v_text_callable_current"))
+
+        if not _obj_exists("table", "text_callable_review"):
+            return  # cannot continue without the table
+
+        # ------------------------------------------------------------------
+        # P2: candidate view includes module-level functions
+
+        _assert("P2: greet in v_text_callable_candidate",
+            q1(tmp,
+                "SELECT 1 FROM v_text_callable_candidate "
+                "WHERE qualified_name = 'textcmd.greet'") is not None)
+        _assert("P2: farewell in v_text_callable_candidate",
+            q1(tmp,
+                "SELECT 1 FROM v_text_callable_candidate "
+                "WHERE qualified_name = 'textcmd.farewell'") is not None)
+
+        # ------------------------------------------------------------------
+        # Helpers for the remaining tests
+
+        def _entity_body_hash(qname: str):
+            """Return (entity_id, body_sha256) for a qualified name, or (None, None)."""
+            row = q1(tmp,
+                "SELECT entity_id FROM v_text_callable_candidate "
+                "WHERE qualified_name = ?", (qname,))
+            if row is None:
+                return None, None
+            eid = row["entity_id"]
+            hash_row = q1(tmp,
+                "SELECT hash_value FROM entity_hash "
+                "WHERE entity_id = ? AND hash_kind = 'body_sha256' "
+                "ORDER BY scan_run_id DESC LIMIT 1",
+                (eid,))
+            return eid, (hash_row["hash_value"] if hash_row else None)
+
+        scan_row = q1(tmp, "SELECT id FROM scan_run ORDER BY id DESC LIMIT 1")
+        scan_run_id = scan_row["id"] if scan_row else None
+        now = "2026-06-24T00:00:00Z"
+
+        def _insert_review(entity_id, body_hash: str, exposure_status: str) -> None:
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute(
+                    "INSERT INTO text_callable_review "
+                    "(entity_id, scan_run_id, signature_hash, body_hash, "
+                    " docstring_status, arg_textish_status, return_textish_status, "
+                    " exposure_status, review_note, reviewed_by, reviewed_at) "
+                    "VALUES (?, ?, 'sig-placeholder', ?, "
+                    " 'reviewed', 'textish', 'textish', "
+                    " ?, NULL, 'test-harness', ?)",
+                    (entity_id, scan_run_id, body_hash, exposure_status, now),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+        greet_id,   greet_hash   = _entity_body_hash("textcmd.greet")
+        farewell_id, farewell_hash = _entity_body_hash("textcmd.farewell")
+        welcome_id,  welcome_hash  = _entity_body_hash("textcmd.welcome")
+        sendoff_id,  sendoff_hash  = _entity_body_hash("textcmd.sendoff")
+
+        _assert("P: greet entity_id and body_hash resolved",
+            greet_id is not None and greet_hash is not None)
+        if greet_id is None or greet_hash is None:
+            return
+
+        # ------------------------------------------------------------------
+        # P3: approved + matching body_hash → appears in v_text_callable_current
+
+        _insert_review(greet_id, greet_hash, "approved")
+        _assert("P3: approved+matching hash appears in v_text_callable_current",
+            q1(tmp,
+                "SELECT 1 FROM v_text_callable_current "
+                "WHERE qualified_name = 'textcmd.greet'") is not None)
+
+        # ------------------------------------------------------------------
+        # P4: approved + mismatched body_hash → absent from v_text_callable_current
+
+        if farewell_id:
+            _insert_review(farewell_id, "wrong-hash-00000000000000000000", "approved")
+            _assert("P4: approved+mismatched hash absent from v_text_callable_current",
+                q1(tmp,
+                    "SELECT 1 FROM v_text_callable_current "
+                    "WHERE qualified_name = 'textcmd.farewell'") is None)
+
+        # ------------------------------------------------------------------
+        # P5: candidate status → hidden from v_text_callable_current
+
+        if welcome_id and welcome_hash:
+            _insert_review(welcome_id, welcome_hash, "candidate")
+            _assert("P5: candidate status hidden from v_text_callable_current",
+                q1(tmp,
+                    "SELECT 1 FROM v_text_callable_current "
+                    "WHERE qualified_name = 'textcmd.welcome'") is None)
+
+        # ------------------------------------------------------------------
+        # P6: rejected status → hidden from v_text_callable_current
+
+        if sendoff_id and sendoff_hash:
+            _insert_review(sendoff_id, sendoff_hash, "rejected")
+            _assert("P6: rejected status hidden from v_text_callable_current",
+                q1(tmp,
+                    "SELECT 1 FROM v_text_callable_current "
+                    "WHERE qualified_name = 'textcmd.sendoff'") is None)
+
+
+# ---------------------------------------------------------------------------
 
 
 def main() -> None:
@@ -1463,6 +1615,7 @@ def main() -> None:
     test_validate_source_path_semantics()
     test_sql_extractor_scope()
     test_external_symbol_observations()
+    test_text_callable_review()
 
     total  = len(_results)
     passed = sum(1 for _, ok, _ in _results if ok)
