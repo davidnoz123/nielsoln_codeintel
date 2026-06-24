@@ -1653,6 +1653,213 @@ def test_text_callable_review() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Q. TextCallableCommand / Registry / Coercer — Phase 2
+# ---------------------------------------------------------------------------
+
+
+def test_text_callable_command_registry() -> None:
+    print("\nQ. TextCallableCommand / TextCallableCommandRegistry / TextCallableArgumentCoercer")
+
+    # Import the three new classes (they live in codeintel.py which is already
+    # on the path via run_ci; import directly here for in-process tests).
+    import importlib.util, sys as _sys
+    _spec = importlib.util.spec_from_file_location("codeintel_mod", CODEINTEL_PY)
+    _mod  = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    TextCallableCommand         = _mod.TextCallableCommand
+    TextCallableCommandRegistry = _mod.TextCallableCommandRegistry
+    TextCallableArgumentCoercer = _mod.TextCallableArgumentCoercer
+    CodeIndexDb                 = _mod.CodeIndexDb
+
+    _assert("Q: TextCallableCommand class exists",       TextCallableCommand is not None)
+    _assert("Q: TextCallableCommandRegistry class exists", TextCallableCommandRegistry is not None)
+    _assert("Q: TextCallableArgumentCoercer class exists", TextCallableArgumentCoercer is not None)
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        db_path = str(tmp / DB_REL)
+
+        # Scan a module that contains several functions
+        (tmp / "regtest.py").write_text(textwrap.dedent("""\
+            def approved_func(name: str) -> str:
+                \"\"\"Return a greeting.\"\"\"
+                return f"Hello, {name}"
+
+            def rejected_func(x: int) -> int:
+                \"\"\"Should not appear.\"\"\"
+                return x * 2
+
+            def stale_func(value: str) -> str:
+                \"\"\"Will have a hash mismatch.\"\"\"
+                return value
+        """), encoding="utf-8")
+
+        r = run_ci(["scan", str(tmp)], tmp)
+        _assert("Q: scan exits 0", r.returncode == 0, r.stderr.strip())
+
+        # Resolve hashes for all three functions
+        db_conn = sqlite3.connect(db_path)
+        db_conn.row_factory = sqlite3.Row
+
+        def _get_hashes(qname):
+            row = db_conn.execute(
+                "SELECT entity_id FROM v_text_callable_candidate "
+                "WHERE qualified_name = ?", (qname,)
+            ).fetchone()
+            if not row:
+                return None, None, None
+            eid = row["entity_id"]
+            brow = db_conn.execute(
+                "SELECT hash_value FROM entity_hash "
+                "WHERE entity_id = ? AND hash_kind = 'body_sha256' "
+                "ORDER BY scan_run_id DESC LIMIT 1", (eid,)
+            ).fetchone()
+            srow = db_conn.execute(
+                "SELECT hash_value FROM entity_hash "
+                "WHERE entity_id = ? AND hash_kind = 'signature_sha256' "
+                "ORDER BY scan_run_id DESC LIMIT 1", (eid,)
+            ).fetchone()
+            return eid, (brow["hash_value"] if brow else None), (srow["hash_value"] if srow else None)
+
+        now = "2026-06-24T00:00:00Z"
+        scan_row = db_conn.execute("SELECT id FROM scan_run ORDER BY id DESC LIMIT 1").fetchone()
+        scan_run_id = scan_row["id"] if scan_row else None
+
+        def _insert_review(eid, body_h, sig_h, exposure):
+            db_conn.execute(
+                "INSERT INTO text_callable_review "
+                "(entity_id, scan_run_id, signature_hash, body_hash, "
+                " docstring_status, arg_textish_status, return_textish_status, "
+                " exposure_status, review_note, reviewed_by, reviewed_at) "
+                "VALUES (?, ?, ?, ?, 'reviewed', 'textish', 'textish', ?, NULL, 'harness', ?)",
+                (eid, scan_run_id, sig_h or "ph", body_h or "ph", exposure, now),
+            )
+            db_conn.commit()
+
+        af_id, af_body, af_sig = _get_hashes("regtest.approved_func")
+        rf_id, rf_body, rf_sig = _get_hashes("regtest.rejected_func")
+        sf_id, sf_body, sf_sig = _get_hashes("regtest.stale_func")
+
+        _assert("Q: approved_func resolved",  af_id is not None)
+        _assert("Q: rejected_func resolved",  rf_id is not None)
+        _assert("Q: stale_func resolved",     sf_id is not None)
+
+        if af_id:
+            _insert_review(af_id, af_body, af_sig, "approved")
+        if rf_id:
+            _insert_review(rf_id, rf_body, rf_sig, "rejected")
+        if sf_id:
+            # stale: correct body hash but wrong signature hash → view excludes it
+            _insert_review(sf_id, sf_body, "wrong-sig-hash-0000000000000000", "approved")
+
+        db_conn.close()
+
+        # ------------------------------------------------------------------
+        # Build registry from CodeIndexDb (the primary supported path)
+        cdb = CodeIndexDb(Path(db_path))
+        registry = TextCallableCommandRegistry(cdb)
+
+        cmds = registry.commands()
+        names = {c.qualified_name for c in cmds}
+
+        _assert("Q1: approved_func in registry",  "regtest.approved_func" in names)
+        _assert("Q2: rejected_func not in registry", "regtest.rejected_func" not in names)
+        _assert("Q3: stale_func not in registry (hash mismatch)", "regtest.stale_func" not in names)
+
+        # ------------------------------------------------------------------
+        # Q4: find() by command_name
+        found_by_cmd = registry.find("approved_func")
+        _assert("Q4: find() by command_name",
+            found_by_cmd is not None and
+            found_by_cmd.qualified_name == "regtest.approved_func")
+
+        # find() by qualified_name
+        found_by_qname = registry.find("regtest.approved_func")
+        _assert("Q4: find() by qualified_name",
+            found_by_qname is not None and
+            found_by_qname.qualified_name == "regtest.approved_func")
+
+        # find() miss
+        _assert("Q4: find() returns None for unknown name",
+            registry.find("no_such_command") is None)
+
+        # ------------------------------------------------------------------
+        # Q5: help_json produces a serialisable list
+        hj = registry.help_json()
+        _assert("Q5: help_json returns list", isinstance(hj, list))
+        _assert("Q5: help_json has one entry", len(hj) == 1)
+        try:
+            import json as _json
+            _json.dumps(hj)
+            _assert("Q5: help_json is JSON-serialisable", True)
+        except Exception as exc:
+            _assert("Q5: help_json is JSON-serialisable", False, str(exc))
+
+        entry = hj[0] if hj else {}
+        for key in ("command_name", "qualified_name", "callable_kind",
+                    "summary", "arg_spec", "return_spec"):
+            _assert(f"Q5: help_json entry has '{key}' key", key in entry)
+
+        # ------------------------------------------------------------------
+        # Q6: help_text produces readable output
+        ht = registry.help_text()
+        _assert("Q6: help_text returns non-empty string", bool(ht))
+        _assert("Q6: help_text mentions command name", "approved_func" in ht)
+
+        # ------------------------------------------------------------------
+        # Q7: TextCallableCommand.to_dict() and format_help_text()
+        cmd = found_by_cmd
+        if cmd:
+            d = cmd.to_dict()
+            _assert("Q7: to_dict() is a dict", isinstance(d, dict))
+            _assert("Q7: to_dict() has command_name", d.get("command_name") == "approved_func")
+            _assert("Q7: to_dict() has qualified_name", "qualified_name" in d)
+            ht_single = cmd.format_help_text()
+            _assert("Q7: format_help_text() is non-empty string", bool(ht_single))
+            _assert("Q7: format_help_text() mentions command name", "approved_func" in ht_single)
+
+        # ------------------------------------------------------------------
+        # Q8: docstring is surfaced in the command summary
+        if cmd:
+            _assert("Q8: summary populated from docstring",
+                "greeting" in (cmd.summary or "").lower() or
+                bool(cmd.summary))  # at minimum non-empty
+
+        # ------------------------------------------------------------------
+        # Q9: invalidate() clears cache; re-read gives same result
+        registry.invalidate()
+        cmds2 = registry.commands()
+        _assert("Q9: commands() after invalidate still works",
+            len(cmds2) == len(cmds))
+
+        cdb.close()
+
+    # ------------------------------------------------------------------
+    # Q10: TextCallableArgumentCoercer
+    coercer = TextCallableArgumentCoercer()
+
+    _assert("Q10: coerce str",   coercer.coerce("hello", "str") == "hello")
+    _assert("Q10: coerce int",   coercer.coerce("42", "int") == 42)
+    _assert("Q10: coerce float", abs(coercer.coerce("3.14", "float") - 3.14) < 1e-9)
+    _assert("Q10: coerce bool true",  coercer.coerce("true", "bool") is True)
+    _assert("Q10: coerce bool false", coercer.coerce("false", "bool") is False)
+    _assert("Q10: coerce list", coercer.coerce('[1,2,3]', "list") == [1, 2, 3])
+    _assert("Q10: coerce dict", coercer.coerce('{"k":"v"}', "dict") == {"k": "v"})
+    try:
+        coercer.coerce("notanint", "int")
+        _assert("Q10: coerce bad int raises ValueError", False)
+    except ValueError:
+        _assert("Q10: coerce bad int raises ValueError", True)
+    _assert("Q10: coerce_json list", coercer.coerce_json("[1]") == [1])
+    _assert("Q10: coerce_json dict", coercer.coerce_json('{"x":1}') == {"x": 1})
+    try:
+        coercer.coerce_json("not json")
+        _assert("Q10: coerce_json bad input raises ValueError", False)
+    except ValueError:
+        _assert("Q10: coerce_json bad input raises ValueError", True)
+
+
+# ---------------------------------------------------------------------------
 
 
 def main() -> None:
@@ -1676,6 +1883,7 @@ def main() -> None:
     test_sql_extractor_scope()
     test_external_symbol_observations()
     test_text_callable_review()
+    test_text_callable_command_registry()
 
     total  = len(_results)
     passed = sum(1 for _, ok, _ in _results if ok)

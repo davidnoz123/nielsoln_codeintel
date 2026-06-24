@@ -4044,6 +4044,299 @@ def validate_source(
 
 
 # ---------------------------------------------------------------------------
+# TextCallableCommand — metadata object for a single approved callable
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TextCallableCommand:
+    """
+    Metadata representation of a single AI-approved text-callable function.
+
+    This object is **metadata only**.  It does not hold a reference to the
+    live callable and does not execute code.
+
+    Fields are populated from ``v_text_callable_current`` rows at registry
+    load time.  A future phase may add ``invoke()`` — leave room by keeping
+    the dataclass open.
+    """
+
+    command_name: str           # short name derived from the function name
+    entity_id: int
+    qualified_name: str
+    callable_kind: str          # entity_type from the scanner (e.g. python_function)
+    summary: str                # first sentence of docstring, if available
+    description: str            # full docstring text, if available
+    arg_spec: List[Dict[str, Any]]   # [{name, type, description}]
+    return_spec: Dict[str, Any]      # {type, description}
+    repo_name: str
+    repo_root: str
+    file_path: str
+    start_line: Optional[int]
+    end_line: Optional[int]
+    review_note: Optional[str]
+    reviewed_by: Optional[str]
+    reviewed_at: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return a JSON-serialisable dict suitable for MCP tool descriptions."""
+        return {
+            "command_name":   self.command_name,
+            "entity_id":      self.entity_id,
+            "qualified_name": self.qualified_name,
+            "callable_kind":  self.callable_kind,
+            "summary":        self.summary,
+            "description":    self.description,
+            "arg_spec":       self.arg_spec,
+            "return_spec":    self.return_spec,
+            "repo_name":      self.repo_name,
+            "repo_root":      self.repo_root,
+            "file_path":      self.file_path,
+            "start_line":     self.start_line,
+            "end_line":       self.end_line,
+            "review_note":    self.review_note,
+            "reviewed_by":    self.reviewed_by,
+            "reviewed_at":    self.reviewed_at,
+        }
+
+    def format_help_text(self) -> str:
+        """Return a human-readable help block for this command."""
+        lines: List[str] = [
+            f"command       : {self.command_name}",
+            f"qualified_name: {self.qualified_name}",
+            f"kind          : {self.callable_kind}",
+        ]
+        if self.summary:
+            lines.append(f"summary       : {self.summary}")
+        if self.description and self.description != self.summary:
+            for dl in self.description.splitlines():
+                lines.append(f"  {dl}")
+        if self.arg_spec:
+            lines.append("args:")
+            for a in self.arg_spec:
+                atype = a.get("type") or "any"
+                adesc = a.get("description") or ""
+                suffix = f"  — {adesc}" if adesc else ""
+                lines.append(f"    {a['name']} : {atype}{suffix}")
+        ret_type = self.return_spec.get("type") or "any"
+        ret_desc = self.return_spec.get("description") or ""
+        ret_suffix = f"  — {ret_desc}" if ret_desc else ""
+        lines.append(f"returns       : {ret_type}{ret_suffix}")
+        if self.file_path:
+            loc = f"{self.file_path}:{self.start_line}-{self.end_line}" \
+                  if self.start_line else self.file_path
+            lines.append(f"location      : {loc}")
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# TextCallableArgumentCoercer — lightweight text → Python value converter
+# ---------------------------------------------------------------------------
+
+
+class TextCallableArgumentCoercer:
+    """
+    Convert text (or already-typed) inputs into Python values.
+
+    Supported target types: str, int, float, bool, list, dict.
+    For list/dict the input is parsed as JSON.
+
+    Keep this intentionally small — do not overbuild.
+    """
+
+    def coerce(self, value: object, target_type: str) -> object:
+        """
+        Coerce *value* to *target_type*.
+
+        *target_type* is a lowercase string: ``'str'``, ``'int'``,
+        ``'float'``, ``'bool'``, ``'list'``, ``'dict'``.
+
+        Raises ``ValueError`` on conversion failure.
+        """
+        t = (target_type or "str").strip().lower()
+        raw = str(value) if not isinstance(value, str) else value
+
+        if t == "str":
+            return raw
+        if t == "int":
+            try:
+                return int(raw)
+            except (ValueError, TypeError):
+                raise ValueError(f"cannot coerce {raw!r} to int")
+        if t == "float":
+            try:
+                return float(raw)
+            except (ValueError, TypeError):
+                raise ValueError(f"cannot coerce {raw!r} to float")
+        if t == "bool":
+            if isinstance(value, bool):
+                return value
+            if raw.strip().lower() in ("1", "true", "yes", "y", "on"):
+                return True
+            if raw.strip().lower() in ("0", "false", "no", "n", "off"):
+                return False
+            raise ValueError(f"cannot coerce {raw!r} to bool")
+        if t in ("list", "dict"):
+            return self.coerce_json(raw)
+        # Unknown type — pass through as string.
+        return raw
+
+    def coerce_json(self, text: str) -> object:
+        """Parse *text* as JSON and return the result."""
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid JSON: {exc}") from exc
+
+
+# ---------------------------------------------------------------------------
+# TextCallableCommandRegistry — DB-backed registry of approved commands
+# ---------------------------------------------------------------------------
+
+
+class TextCallableCommandRegistry:
+    """
+    Materialise approved TextCallableCommand objects from ``v_text_callable_current``.
+
+    The registry is **not** manually populated.  It reads directly from the
+    database so that an AI review approval (followed by a rescan) automatically
+    makes a command available — with no code changes required.
+
+    The *db* argument accepts any object that exposes a ``query(sql, params)``
+    method returning a list of row-like objects supporting ``row["column"]``
+    access.  Both ``CodeIndexDb`` and ``CodeIntelDbUnionConnection`` satisfy
+    this contract.  A raw ``sqlite3.Connection`` is also accepted.
+
+    Design note: ``invoke()`` is intentionally absent.  A future phase will
+    add execution, dispatch, and MCP exposure.
+    """
+
+    def __init__(self, db: object) -> None:
+        self._db = db
+        self._cache: Optional[List[TextCallableCommand]] = None
+
+    # ------------------------------------------------------------------
+    # Public API
+
+    def commands(self) -> List[TextCallableCommand]:
+        """Return all currently approved TextCallableCommands."""
+        if self._cache is None:
+            self._cache = self._load()
+        return list(self._cache)
+
+    def find(self, name: str) -> Optional[TextCallableCommand]:
+        """
+        Look up a command by command_name or qualified_name.
+        Returns None if not found.
+        """
+        for cmd in self.commands():
+            if cmd.command_name == name or cmd.qualified_name == name:
+                return cmd
+        return None
+
+    def help_json(self) -> List[Dict[str, Any]]:
+        """Return a list of to_dict() payloads for all approved commands."""
+        return [cmd.to_dict() for cmd in self.commands()]
+
+    def help_text(self) -> str:
+        """Return a human-readable listing of all approved commands."""
+        cmds = self.commands()
+        if not cmds:
+            return "No approved text-callable commands found."
+        blocks = [cmd.format_help_text() for cmd in cmds]
+        return "\n\n".join(blocks)
+
+    def invalidate(self) -> None:
+        """Drop the in-memory cache so the next call re-reads from the DB."""
+        self._cache = None
+
+    # ------------------------------------------------------------------
+    # Private
+
+    def _query(self, sql: str, params: tuple = ()) -> list:
+        db = self._db
+        # CodeIndexDb / CodeIntelDbUnionConnection
+        if hasattr(db, "query"):
+            return db.query(sql, params)
+        # Raw sqlite3.Connection
+        if hasattr(db, "execute"):
+            db.row_factory = sqlite3.Row  # type: ignore[union-attr]
+            return db.execute(sql, params).fetchall()  # type: ignore[union-attr]
+        raise TypeError(f"unsupported db type: {type(db)!r}")
+
+    @staticmethod
+    def _row_get(row: object, key: str, default: object = None) -> object:
+        """Read a column from a sqlite3.Row, dict, or object."""
+        if isinstance(row, dict):
+            return row.get(key, default)
+        try:
+            return row[key]  # type: ignore[index]
+        except (KeyError, IndexError):
+            pass
+        return getattr(row, key, default)
+
+    def _load(self) -> List[TextCallableCommand]:
+        rows = self._query(
+            "SELECT review_id, entity_id, qualified_name, name, entity_type, "
+            "       file_path, start_line, end_line, language, "
+            "       docstring_status, arg_textish_status, return_textish_status, "
+            "       exposure_status, review_note, reviewed_by, reviewed_at "
+            "FROM v_text_callable_current "
+            "ORDER BY qualified_name"
+        )
+
+        commands: List[TextCallableCommand] = []
+        for row in rows:
+            g = lambda k, d=None: self._row_get(row, k, d)  # noqa: E731
+
+            qname: str = g("qualified_name") or ""
+            # command_name is the last dotted segment (the bare function name)
+            command_name = qname.rsplit(".", 1)[-1] if "." in qname else qname
+
+            # Resolve docstring from entity_text if available
+            summary, description = self._resolve_docstring(g("entity_id"))
+
+            commands.append(TextCallableCommand(
+                command_name   = command_name,
+                entity_id      = int(g("entity_id") or 0),
+                qualified_name = qname,
+                callable_kind  = str(g("entity_type") or ""),
+                summary        = summary,
+                description    = description,
+                arg_spec       = [],   # populated by AI review in a future phase
+                return_spec    = {"type": "text", "description": ""},
+                repo_name      = "",   # not surfaced by v_text_callable_current
+                repo_root      = "",
+                file_path      = str(g("file_path") or ""),
+                start_line     = g("start_line"),
+                end_line       = g("end_line"),
+                review_note    = g("review_note"),
+                reviewed_by    = g("reviewed_by"),
+                reviewed_at    = str(g("reviewed_at") or ""),
+            ))
+        return commands
+
+    def _resolve_docstring(self, entity_id: object) -> tuple:
+        """Return (summary, full_description) from entity_text, or ('', '')."""
+        if entity_id is None:
+            return "", ""
+        try:
+            rows = self._query(
+                "SELECT text_body FROM entity_text "
+                "WHERE entity_id = ? AND text_kind = 'docstring'",
+                (entity_id,),
+            )
+        except Exception:
+            return "", ""
+        if not rows:
+            return "", ""
+        body: str = str(self._row_get(rows[0], "text_body") or "")
+        first_para = body.split("\n\n")[0].strip()
+        first_line = first_para.splitlines()[0].strip() if first_para else ""
+        return first_line, body
+
+
+# ---------------------------------------------------------------------------
 # Publication mapping — the explicit source of command truth
 # ---------------------------------------------------------------------------
 
