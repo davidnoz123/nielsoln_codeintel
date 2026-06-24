@@ -30,6 +30,11 @@ CODEINTEL_PY = str(Path(__file__).resolve().parent / "codeintel.py")
 PYTHON = sys.executable
 DB_REL = Path(".codeintel") / "codeintel.sqlite"
 
+# NOTE: Unit tests for CodeIntelDbUnionConnection live in a separate file:
+#   codeintel_db_union_connection_test.py
+# A future version of this harness may invoke that test module as part of a
+# broader confidence run (e.g. via unittest.main or subprocess).
+
 # ---------------------------------------------------------------------------
 # Result tracking
 # ---------------------------------------------------------------------------

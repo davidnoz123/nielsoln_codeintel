@@ -2514,6 +2514,250 @@ class CodeScanner:
 
 
 # ---------------------------------------------------------------------------
+# CodeIntelDbUnionConnection
+# ---------------------------------------------------------------------------
+
+
+class CodeIntelDbUnionConnection:
+    """
+    A read-only, multi-repo union connection over one or more codeintel
+    SQLite databases.
+
+    Public API resembles a database connection::
+
+        conn = CodeIntelDbUnionConnection(repos)
+        conn.execute(sql, params)   # returns self
+        conn.fetchall()             # returns list[dict]
+        conn.query(sql, params)     # execute + fetchall
+        conn.close()                # lifecycle hook
+        conn.diagnose()             # repo/db status information
+        conn.cursor()               # raises NotImplementedError
+
+    Each element of ``repos`` is a dict with string keys:
+
+        name     — human-readable repo name
+        root     — repo root path (str or Path)
+        db_path  — path to the repo's SQLite database file
+
+    Repo metadata is automatically injected as named parameters into every
+    query.  User SQL may reference them as ``:__repo_name``,
+    ``:__repo_root``, and ``:__repo_db_path``.  Params must be a dict
+    (not a positional tuple) to reference these names.
+
+    SQL support
+    -----------
+    SELECT and WITH are accepted.  The following are rejected:
+
+        INSERT, UPDATE, DELETE, REPLACE, CREATE, DROP, ALTER,
+        VACUUM, PRAGMA, ATTACH, DETACH, multiple statements.
+
+    This is a limitation of the current execution engine, not necessarily
+    a limitation of the future API.
+
+    Current implementation
+    ----------------------
+    - Read-only (URI ``mode=ro`` + readonly authorizer).
+    - One repo DB opened per query; rows merged in Python.
+
+    Future implementations may support ATTACH batching, materialised
+    unions, caches, and richer SQL.
+    """
+
+    _REJECT_KW_RE = re.compile(
+        r"^\s*(?:INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER"
+        r"|VACUUM|PRAGMA|ATTACH|DETACH)\b",
+        re.IGNORECASE,
+    )
+    # A semicolon followed by any non-whitespace signals a second statement.
+    _MULTI_STMT_RE = re.compile(r";\s*\S")
+
+    def __init__(self, repos: List[Dict[str, Any]]) -> None:
+        self._repos: List[Dict[str, Any]] = list(repos)
+        self._last_rows: List[Dict] = []
+
+    # ------------------------------------------------------------------
+    # Public API
+
+    def execute(self, sql: str, params=None) -> "CodeIntelDbUnionConnection":
+        """Execute sql against all repos; store merged rows; return self."""
+        self._assert_supported_sql(sql)
+        self._last_rows = self._execute_map_reduce_select(sql, params)
+        return self
+
+    def fetchall(self) -> List[Dict]:
+        """Return rows from the last execute() call."""
+        return self._last_rows
+
+    def query(self, sql: str, params=None) -> List[Dict]:
+        """Execute sql and return rows (execute + fetchall)."""
+        return self.execute(sql, params).fetchall()
+
+    def close(self) -> None:
+        """Lifecycle hook; releases no resources in the current implementation."""
+
+    def diagnose(self) -> Dict[str, Any]:
+        """Return per-repo status information (name, root, db_path, db_exists, db_size)."""
+        entries: List[Dict[str, Any]] = []
+        for repo in self._repos:
+            db_path = self._repo_value(repo, "db_path")
+            p = Path(db_path) if db_path else None
+            db_exists = bool(p and p.exists())
+            entries.append(
+                {
+                    "name":      self._repo_value(repo, "name"),
+                    "root":      self._repo_value(repo, "root"),
+                    "db_path":   db_path,
+                    "db_exists": db_exists,
+                    "db_size":   p.stat().st_size if db_exists and p else None,
+                }
+            )
+        return {"repos": entries}
+
+    def cursor(self):
+        """Not supported; use execute(), fetchall(), or query() instead."""
+        raise NotImplementedError(
+            "CodeIntelDbUnionConnection does not expose a raw cursor. "
+            "Use execute(), fetchall(), or query() instead."
+        )
+
+    # ------------------------------------------------------------------
+    # Private: SQL safety
+
+    @classmethod
+    def _assert_supported_sql(cls, sql: str) -> None:
+        """Raise ValueError for disallowed SQL or multiple statements.
+
+        Note: this guard is a limitation of the current execution engine,
+        not necessarily the future API.
+        """
+        stripped = sql.strip()
+        if not stripped:
+            raise ValueError("SQL statement is empty")
+
+        # Reject multiple statements (semicolon followed by non-whitespace)
+        if cls._MULTI_STMT_RE.search(stripped):
+            raise ValueError(
+                "Multiple SQL statements are not supported in this execution engine"
+            )
+
+        # Allow only SELECT and WITH
+        first_kw_m = re.match(r"^\s*(\w+)", stripped, re.IGNORECASE)
+        if first_kw_m:
+            kw = first_kw_m.group(1).upper()
+            if kw not in ("SELECT", "WITH"):
+                raise ValueError(
+                    f"SQL keyword {kw!r} is not supported. "
+                    "Only SELECT and WITH are accepted in this execution engine."
+                )
+
+    # ------------------------------------------------------------------
+    # Private: execution
+
+    def _execute_map_reduce_select(self, sql: str, params) -> List[Dict]:
+        """Query each repo independently and merge the resulting rows."""
+        rows: List[Dict] = []
+        for repo in self._repos:
+            rows.extend(self._query_one_repo(repo, sql, params))
+        return rows
+
+    def _query_one_repo(
+        self, repo: Dict[str, Any], sql: str, params
+    ) -> List[Dict]:
+        """Open repo's DB read-only, execute sql, return list[dict]."""
+        db_path = self._repo_value(repo, "db_path")
+        uri = self._readonly_sqlite_uri(db_path)
+        conn = sqlite3.connect(uri, uri=True)
+        conn.row_factory = sqlite3.Row
+        self._install_readonly_authorizer(conn)
+        try:
+            merged = self._prepare_repo_params(repo, params)
+            cur = conn.execute(sql, merged)
+            return [dict(row) for row in cur.fetchall()]
+        finally:
+            conn.close()
+
+    def _prepare_repo_params(
+        self, repo: Dict[str, Any], user_params
+    ) -> object:
+        """
+        Return a params object suitable for sqlite3.execute().
+
+        If user_params is None or a dict, inject repo metadata named params
+        (__repo_name, __repo_root, __repo_db_path) into a new dict and return
+        it.  If user_params is a positional sequence, return it unchanged
+        (repo metadata is not available as named params in that case).
+        """
+        meta: Dict[str, str] = {
+            "__repo_name":    self._repo_value(repo, "name"),
+            "__repo_root":    self._repo_value(repo, "root"),
+            "__repo_db_path": self._repo_value(repo, "db_path"),
+        }
+        if user_params is None:
+            return meta
+        if isinstance(user_params, dict):
+            merged = dict(user_params)
+            merged.update(meta)
+            return merged
+        # Positional params (tuple/list) — pass through unchanged.
+        return user_params
+
+    @staticmethod
+    def _repo_value(repo: object, key: str) -> str:
+        """Return the value for ``key`` from a repo dict or repo object.
+
+        Supports both dict-style (``repo["key"]``) and attribute-style
+        (``repo.key``) access so that plain dicts and gateway repo objects
+        work interchangeably.
+
+        Special case: when ``key`` is ``"db_path"`` and the repo has no
+        ``db_path`` field, ``codeintel_db_path`` is tried as a fallback.
+        This lets gateway objects that expose ``codeintel_db_path`` be used
+        without renaming.
+        """
+        keys_to_try = [key]
+        if key == "db_path":
+            keys_to_try.append("codeintel_db_path")
+
+        for k in keys_to_try:
+            # Dict-style access
+            if isinstance(repo, dict):
+                v = repo.get(k)
+            else:
+                v = getattr(repo, k, None)
+            if v is not None and v != "":
+                return str(v)
+        return ""
+
+    @staticmethod
+    def _readonly_sqlite_uri(db_path: str) -> str:
+        """Return a read-only SQLite URI for db_path."""
+        p = Path(db_path).resolve().as_posix()
+        # as_posix() on Windows yields 'C:/...' (no leading slash);
+        # SQLite URI requires three slashes for absolute paths on all platforms.
+        if not p.startswith("/"):
+            p = "/" + p
+        return f"file://{p}?mode=ro"
+
+    @staticmethod
+    def _install_readonly_authorizer(conn: sqlite3.Connection) -> None:
+        """
+        Install a SQLite authorizer that permits only read-related actions.
+
+        Provides defence-in-depth on top of the URI mode=ro flag.
+        """
+        _ALLOWED = frozenset({
+            sqlite3.SQLITE_SELECT,
+            sqlite3.SQLITE_READ,
+            sqlite3.SQLITE_FUNCTION,
+        })
+
+        def _authorizer(action, arg1, arg2, db_name, trigger_name):
+            return sqlite3.SQLITE_OK if action in _ALLOWED else sqlite3.SQLITE_DENY
+
+        conn.set_authorizer(_authorizer)
+
+
+# ---------------------------------------------------------------------------
 # CLI helpers
 # ---------------------------------------------------------------------------
 
