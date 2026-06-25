@@ -2563,8 +2563,8 @@ class CodeIntelDbUnionConnection:
 
     Repo metadata is automatically injected as named parameters into every
     query.  User SQL may reference them as ``:__repo_name``,
-    ``:__repo_root``, and ``:__repo_db_path``.  Params must be a dict
-    (not a positional tuple) to reference these names.
+    ``:__repo_root``, ``:__repo_db_path``, and ``:__repo_key``.  Params
+    must be a dict (not a positional tuple) to reference these names.
 
     SQL support
     -----------
@@ -2618,7 +2618,7 @@ class CodeIntelDbUnionConnection:
         """Lifecycle hook; releases no resources in the current implementation."""
 
     def diagnose(self) -> Dict[str, Any]:
-        """Return per-repo status information (name, root, db_path, db_exists, db_size)."""
+        """Return per-repo status information (name, root, db_path, repo_key, db_exists, db_size)."""
         entries: List[Dict[str, Any]] = []
         for repo in self._repos:
             db_path = self._repo_value(repo, "db_path")
@@ -2626,11 +2626,12 @@ class CodeIntelDbUnionConnection:
             db_exists = bool(p and p.exists())
             entries.append(
                 {
-                    "name":      self._repo_value(repo, "name"),
-                    "root":      self._repo_value(repo, "root"),
-                    "db_path":   db_path,
+                    "name":     self._repo_value(repo, "name"),
+                    "root":     self._repo_value(repo, "root"),
+                    "db_path":  db_path,
+                    "repo_key": self._repo_key(repo),
                     "db_exists": db_exists,
-                    "db_size":   p.stat().st_size if db_exists and p else None,
+                    "db_size":  p.stat().st_size if db_exists and p else None,
                 }
             )
         return {"repos": entries}
@@ -2713,6 +2714,7 @@ class CodeIntelDbUnionConnection:
             "__repo_name":    self._repo_value(repo, "name"),
             "__repo_root":    self._repo_value(repo, "root"),
             "__repo_db_path": self._repo_value(repo, "db_path"),
+            "__repo_key":     self._repo_key(repo),
         }
         if user_params is None:
             return meta
@@ -2722,6 +2724,41 @@ class CodeIntelDbUnionConnection:
             return merged
         # Positional params (tuple/list) — pass through unchanged.
         return user_params
+
+    @staticmethod
+    def _repo_key(repo: object) -> str:
+        """Return a compact, stable identifier for *repo*.
+
+        Priority:
+        1. ``repo.repo_key`` (attribute access)
+        2. ``repo["repo_key"]`` (dict access)
+        3. SHA-256 of normalised ``repo_root`` path — first 16 hex chars
+        4. SHA-256 of normalised ``repo_db_path`` — first 16 hex chars
+        5. Empty string if nothing is available
+
+        The derivation is deterministic: the same path always yields the
+        same key within a Python process and across runs.
+        """
+        import hashlib as _hashlib
+
+        # 1 & 2 — explicit key
+        if isinstance(repo, dict):
+            explicit = repo.get("repo_key")
+        else:
+            explicit = getattr(repo, "repo_key", None)
+        if explicit is not None and explicit != "":
+            return str(explicit)
+
+        # 3 & 4 — derive from root, then db_path
+        for attr in ("root", "db_path", "codeintel_db_path"):
+            if isinstance(repo, dict):
+                raw = repo.get(attr)
+            else:
+                raw = getattr(repo, attr, None)
+            if raw:
+                norm = str(Path(raw).resolve())
+                return _hashlib.sha256(norm.encode()).hexdigest()[:16]
+        return ""
 
     @staticmethod
     def _repo_value(repo: object, key: str) -> str:

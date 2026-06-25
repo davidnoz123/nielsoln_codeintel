@@ -54,13 +54,16 @@ def _make_test_db(rows: list[tuple]) -> str:
 class _RepoObject:
     """Minimal object-style repo for testing attribute access."""
 
-    def __init__(self, name, root, db_path=None, codeintel_db_path=None):
+    def __init__(self, name, root, db_path=None, codeintel_db_path=None,
+                 repo_key=None):
         self.name = name
         self.root = root
         if db_path is not None:
             self.db_path = db_path
         if codeintel_db_path is not None:
             self.codeintel_db_path = codeintel_db_path
+        if repo_key is not None:
+            self.repo_key = repo_key
 
 
 # ---------------------------------------------------------------------------
@@ -458,6 +461,99 @@ class TestCodeintelDbPathAlias(unittest.TestCase):
         conn = CodeIntelDbUnionConnection([repo])
         rows = conn.query("SELECT :__repo_db_path AS rdp")
         self.assertEqual(rows[0]["rdp"], self.db_path)
+
+
+# ---------------------------------------------------------------------------
+# repo_key injection
+# ---------------------------------------------------------------------------
+
+
+class TestRepoKey(unittest.TestCase):
+    """Verify __repo_key injection and _repo_key() derivation logic."""
+
+    def setUp(self):
+        self.db_path = _make_test_db([(1, "rk-row")])
+
+    def tearDown(self):
+        Path(self.db_path).unlink(missing_ok=True)
+
+    # 1. Explicit key on an object repo
+    def test_explicit_object_repo_key(self):
+        repo = _RepoObject(
+            name="r", root="/r", db_path=self.db_path, repo_key="my-obj-key"
+        )
+        conn = CodeIntelDbUnionConnection([repo])
+        rows = conn.query("SELECT :__repo_key AS rk")
+        self.assertEqual(rows[0]["rk"], "my-obj-key")
+
+    # 2. Explicit key in a dict repo
+    def test_explicit_dict_repo_key(self):
+        repo = {
+            "name": "r", "root": "/r",
+            "db_path": self.db_path, "repo_key": "my-dict-key",
+        }
+        conn = CodeIntelDbUnionConnection([repo])
+        rows = conn.query("SELECT :__repo_key AS rk")
+        self.assertEqual(rows[0]["rk"], "my-dict-key")
+
+    # 3. Derived from repo_root when no explicit key given
+    def test_derived_from_repo_root(self):
+        from pathlib import Path as _P
+        import hashlib
+        root = "/some/repo/root"
+        repo = {"name": "r", "root": root, "db_path": self.db_path}
+        conn = CodeIntelDbUnionConnection([repo])
+        rows = conn.query("SELECT :__repo_key AS rk")
+        expected = hashlib.sha256(
+            str(_P(root).resolve()).encode()
+        ).hexdigest()[:16]
+        self.assertEqual(rows[0]["rk"], expected)
+
+    # 4. Falls back to db_path when root is absent
+    def test_fallback_to_db_path(self):
+        from pathlib import Path as _P
+        import hashlib
+        # Provide no root so derivation must fall back to db_path
+        repo = {"name": "r", "root": "", "db_path": self.db_path}
+        conn = CodeIntelDbUnionConnection([repo])
+        rows = conn.query("SELECT :__repo_key AS rk")
+        expected = hashlib.sha256(
+            str(_P(self.db_path).resolve()).encode()
+        ).hexdigest()[:16]
+        self.assertEqual(rows[0]["rk"], expected)
+
+    # 5. Derivation is deterministic (same input → same key)
+    def test_derivation_is_deterministic(self):
+        repo = {"name": "r", "root": "/det/root", "db_path": self.db_path}
+        conn = CodeIntelDbUnionConnection([repo])
+        key1 = conn.query("SELECT :__repo_key AS rk")[0]["rk"]
+        key2 = conn.query("SELECT :__repo_key AS rk")[0]["rk"]
+        self.assertEqual(key1, key2)
+        self.assertEqual(len(key1), 16)
+
+    # 6. __repo_key appears in merged params (injected for every query)
+    def test_repo_key_in_injected_params(self):
+        repo = {
+            "name": "r", "root": "/r",
+            "db_path": self.db_path, "repo_key": "param-key",
+        }
+        conn = CodeIntelDbUnionConnection([repo])
+        rows = conn.query(
+            "SELECT :__repo_name AS rn, :__repo_key AS rk",
+        )
+        self.assertEqual(rows[0]["rn"], "r")
+        self.assertEqual(rows[0]["rk"], "param-key")
+
+    # 7. diagnose() reports repo_key
+    def test_diagnose_reports_repo_key(self):
+        repo = {
+            "name": "r", "root": "/r",
+            "db_path": self.db_path, "repo_key": "diag-key",
+        }
+        conn = CodeIntelDbUnionConnection([repo])
+        entry = conn.diagnose()["repos"][0]
+        self.assertIn("repo_key", entry)
+        self.assertEqual(entry["repo_key"], "diag-key")
 
 
 if __name__ == "__main__":
