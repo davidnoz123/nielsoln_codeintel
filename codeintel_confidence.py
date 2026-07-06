@@ -2483,6 +2483,10 @@ def test_text_callable_self_hosting() -> None:
             def path_param(p: object) -> str:
                 \"\"\"object-typed parameter — not textish.\"\"\"
                 return str(p)
+
+            async def async_tool(name: str) -> str:
+                \"\"\"Async — unsupported until execution layer can await safely.\"\"\"
+                return name
         """), encoding="utf-8")
 
         run_ci(["scan", str(tmp)], tmp)
@@ -2579,6 +2583,15 @@ def test_text_callable_self_hosting() -> None:
             ret_s == "unknown", ret_s)
         _assert("R-J: no_return_annotation NOT in v_text_callable_current",
             not _in_current("sigtest.no_return_annotation"))
+
+        # async functions: _check_signature_textish returns ('not_textish', 'unknown')
+        # for AsyncFunctionDef — async TextCallables are unsupported until the
+        # execution layer can await them safely.
+        arg_s, ret_s = _approve_and_get_status("sigtest.async_tool")
+        _assert("R-J: async_tool arg_textish = not_textish",
+            arg_s == "not_textish", arg_s)
+        _assert("R-J: async_tool NOT in v_text_callable_current (async unsupported)",
+            not _in_current("sigtest.async_tool"))
 
         cdb.close()
 

@@ -990,6 +990,15 @@ def _check_signature_textish(signature_text: str) -> Tuple[str, str]:
         return "unknown", "unknown"
 
     fn = fn_nodes[0]
+
+    # Async TextCallables are deliberately unsupported until the execution
+    # layer can await them safely.  The scanner stores async functions with
+    # entity_type='python_function', so they appear in v_text_callable_candidate;
+    # marking as not_textish here ensures they never reach v_text_callable_current
+    # without requiring a schema change.
+    if isinstance(fn, ast.AsyncFunctionDef):
+        return "not_textish", "unknown"
+
     args = fn.args
 
     # *args / **kwargs → immediately not_textish for arguments
