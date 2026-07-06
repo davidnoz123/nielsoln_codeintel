@@ -2062,6 +2062,377 @@ def test_text_callable_union_isolation() -> None:
 
 
 # ---------------------------------------------------------------------------
+# R. TextCallable self-hosting — Phase 3
+# ---------------------------------------------------------------------------
+
+
+def test_text_callable_self_hosting() -> None:
+    print("\nR. TextCallable self-hosting — Phase 3")
+
+    # Import CodeIndexDb for direct API tests (R-B through R-E)
+    import importlib.util as _ilu
+    _ci_spec = _ilu.spec_from_file_location("codeintel_r", CODEINTEL_PY)
+    _ci_mod  = _ilu.module_from_spec(_ci_spec)
+    _ci_spec.loader.exec_module(_ci_mod)
+    CodeIndexDbR = _ci_mod.CodeIndexDb
+
+    # ------------------------------------------------------------------
+    # R-A. Candidate discovery: strict view (python_function, no _ prefix)
+    print("\nR-A. Candidate discovery")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+
+        (tmp / "tools.py").write_text(textwrap.dedent("""\
+            def safe_tool(name: str = "") -> str:
+                \"\"\"Return a greeting.\"\"\"
+                return "hello " + name
+
+            def _private_tool() -> str:
+                return "no"
+
+            class Service:
+                def method_tool(self) -> str:
+                    return "no"
+        """), encoding="utf-8")
+
+        r = run_ci(["scan", str(tmp)], tmp)
+        _assert("R-A: scan exits 0", r.returncode == 0, r.stderr.strip())
+
+        # safe_tool → python_function, public name → must appear
+        row_safe = q1(tmp,
+            "SELECT entity_type FROM v_text_callable_candidate "
+            "WHERE qualified_name = 'tools.safe_tool'")
+        _assert("R-A: safe_tool in v_text_callable_candidate", row_safe is not None)
+        if row_safe:
+            _assert_eq("R-A: safe_tool entity_type is python_function",
+                row_safe["entity_type"], "python_function")
+
+        # _private_tool → name starts with _ → must be excluded by migration
+        _assert("R-A: _private_tool NOT in v_text_callable_candidate",
+            q1(tmp,
+                "SELECT 1 FROM v_text_callable_candidate "
+                "WHERE qualified_name = 'tools._private_tool'") is None)
+
+        # Service.method_tool → python_method → must be excluded by migration
+        _assert("R-A: Service.method_tool NOT in v_text_callable_candidate",
+            q1(tmp,
+                "SELECT 1 FROM v_text_callable_candidate "
+                "WHERE qualified_name = 'tools.Service.method_tool'") is None)
+
+        # safe_tool must have body and signature hashes
+        safe_row = q1(tmp,
+            "SELECT entity_id FROM v_text_callable_candidate "
+            "WHERE qualified_name = 'tools.safe_tool'")
+        if safe_row:
+            eid = safe_row["entity_id"]
+            body_h = q1(tmp,
+                "SELECT hash_value FROM entity_hash "
+                "WHERE entity_id = ? AND hash_kind = 'body_sha256' "
+                "ORDER BY scan_run_id DESC LIMIT 1", (eid,))
+            sig_h = q1(tmp,
+                "SELECT hash_value FROM entity_hash "
+                "WHERE entity_id = ? AND hash_kind = 'signature_sha256' "
+                "ORDER BY scan_run_id DESC LIMIT 1", (eid,))
+            _assert("R-A: safe_tool has body hash", body_h is not None)
+            _assert("R-A: safe_tool has signature hash", sig_h is not None)
+
+    # ------------------------------------------------------------------
+    # R-B. Approval makes callable current
+    print("\nR-B. Approval makes callable current")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+
+        (tmp / "tools.py").write_text(textwrap.dedent("""\
+            def safe_tool(name: str = "") -> str:
+                \"\"\"Return a greeting.\"\"\"
+                return "hello " + name
+        """), encoding="utf-8")
+
+        run_ci(["scan", str(tmp)], tmp)
+
+        # Use CodeIndexDb API directly (approve_text_callable is not yet in
+        # v_text_callable_current in this fresh DB — bootstrap not run here)
+        cdb = CodeIndexDbR(tmp / DB_REL)
+        result = cdb.approve_text_callable(
+            "tools.safe_tool", reviewer="test", note="R-B test"
+        )
+        cdb.close()
+        _assert("R-B: approve_text_callable returns confirmation",
+            "approved" in result.lower(), result)
+
+        # review row exists and is approved
+        review_row = q1(tmp,
+            "SELECT exposure_status FROM text_callable_review tcr "
+            "JOIN code_entity ce ON ce.id = tcr.entity_id "
+            "WHERE ce.qualified_name = 'tools.safe_tool'")
+        _assert("R-B: review row exists", review_row is not None)
+        if review_row:
+            _assert_eq("R-B: exposure_status = approved",
+                review_row["exposure_status"], "approved")
+
+        # appears in v_text_callable_current
+        _assert("R-B: safe_tool in v_text_callable_current",
+            q1(tmp,
+                "SELECT 1 FROM v_text_callable_current "
+                "WHERE qualified_name = 'tools.safe_tool'") is not None)
+
+    # ------------------------------------------------------------------
+    # R-C. Rejection excludes callable
+    print("\nR-C. Rejection excludes callable")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+
+        (tmp / "tools.py").write_text(textwrap.dedent("""\
+            def safe_tool(name: str = "") -> str:
+                \"\"\"Return a greeting.\"\"\"
+                return "hello " + name
+        """), encoding="utf-8")
+
+        run_ci(["scan", str(tmp)], tmp)
+
+        cdb = CodeIndexDbR(tmp / DB_REL)
+        result = cdb.reject_text_callable(
+            "tools.safe_tool", reviewer="test", note="R-C test"
+        )
+        cdb.close()
+        _assert("R-C: reject_text_callable returns confirmation",
+            "rejected" in result.lower(), result)
+
+        review_row = q1(tmp,
+            "SELECT exposure_status FROM text_callable_review tcr "
+            "JOIN code_entity ce ON ce.id = tcr.entity_id "
+            "WHERE ce.qualified_name = 'tools.safe_tool'")
+        _assert("R-C: review row exists", review_row is not None)
+        if review_row:
+            _assert_eq("R-C: exposure_status = rejected",
+                review_row["exposure_status"], "rejected")
+
+        _assert("R-C: safe_tool NOT in v_text_callable_current",
+            q1(tmp,
+                "SELECT 1 FROM v_text_callable_current "
+                "WHERE qualified_name = 'tools.safe_tool'") is None)
+
+    # ------------------------------------------------------------------
+    # R-D. Body change invalidates approval
+    print("\nR-D. Body change invalidates approval")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+
+        py_file = tmp / "tools.py"
+        py_file.write_text(textwrap.dedent("""\
+            def safe_tool(name: str = "") -> str:
+                \"\"\"Return a greeting.\"\"\"
+                return "hello " + name
+        """), encoding="utf-8")
+        run_ci(["scan", str(tmp)], tmp)
+
+        cdb = CodeIndexDbR(tmp / DB_REL)
+        cdb.approve_text_callable("tools.safe_tool", reviewer="test")
+        cdb.close()
+
+        _assert("R-D: approved before body change",
+            q1(tmp,
+                "SELECT 1 FROM v_text_callable_current "
+                "WHERE qualified_name = 'tools.safe_tool'") is not None)
+
+        # Modify only the body (keep signature identical)
+        py_file.write_text(textwrap.dedent("""\
+            def safe_tool(name: str = "") -> str:
+                \"\"\"Return a greeting.\"\"\"
+                return "hi " + name  # body changed
+        """), encoding="utf-8")
+        run_ci(["scan", str(tmp)], tmp)
+
+        # review row still exists
+        review_row = q1(tmp,
+            "SELECT exposure_status FROM text_callable_review tcr "
+            "JOIN code_entity ce ON ce.id = tcr.entity_id "
+            "WHERE ce.qualified_name = 'tools.safe_tool'")
+        _assert("R-D: review row still exists after body change",
+            review_row is not None)
+
+        # but NOT in v_text_callable_current (body hash mismatch)
+        _assert("R-D: safe_tool absent from v_text_callable_current after body change",
+            q1(tmp,
+                "SELECT 1 FROM v_text_callable_current "
+                "WHERE qualified_name = 'tools.safe_tool'") is None)
+
+    # ------------------------------------------------------------------
+    # R-E. Signature change invalidates approval
+    print("\nR-E. Signature change invalidates approval")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+
+        py_file = tmp / "tools.py"
+        py_file.write_text(textwrap.dedent("""\
+            def safe_tool(name: str = "") -> str:
+                \"\"\"Return a greeting.\"\"\"
+                return "hello " + name
+        """), encoding="utf-8")
+        run_ci(["scan", str(tmp)], tmp)
+
+        cdb = CodeIndexDbR(tmp / DB_REL)
+        cdb.approve_text_callable("tools.safe_tool", reviewer="test")
+        cdb.close()
+
+        # Modify only the signature (add a new parameter)
+        py_file.write_text(textwrap.dedent("""\
+            def safe_tool(name: str = "", loud: bool = False) -> str:
+                \"\"\"Return a greeting.\"\"\"
+                return "hello " + name
+        """), encoding="utf-8")
+        run_ci(["scan", str(tmp)], tmp)
+
+        _assert("R-E: safe_tool absent from v_text_callable_current after signature change",
+            q1(tmp,
+                "SELECT 1 FROM v_text_callable_current "
+                "WHERE qualified_name = 'tools.safe_tool'") is None)
+
+    # ------------------------------------------------------------------
+    # R-F. Bootstrap management functions
+    print("\nR-F. Bootstrap management functions")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+
+        # Scan codeintel.py itself so the management functions are in the DB
+        r_scan = run_ci(["scan", CODEINTEL_PY], tmp)
+        _assert("R-F: scan codeintel.py exits 0", r_scan.returncode == 0, r_scan.stderr.strip())
+
+        r_boot = run_ci(["bootstrap-text-callables"], tmp)
+        _assert("R-F: bootstrap-text-callables exits 0",
+            r_boot.returncode == 0, r_boot.stderr.strip())
+
+        # Each bootstrap qname must appear in v_text_callable_current
+        bootstrap_qnames = [
+            "codeintel.text_callable_candidates",
+            "codeintel.text_callables",
+            "codeintel.approve_text_callable",
+            "codeintel.reject_text_callable",
+            "codeintel.text_callable_help_json",
+        ]
+        for qname in bootstrap_qnames:
+            row = q1(tmp,
+                "SELECT 1 FROM v_text_callable_current WHERE qualified_name = ?",
+                (qname,))
+            _assert(f"R-F: {qname} in v_text_callable_current", row is not None)
+
+    # ------------------------------------------------------------------
+    # R-G. Bootstrap does not overwrite rejection
+    print("\nR-G. Bootstrap does not overwrite rejection")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+
+        run_ci(["scan", CODEINTEL_PY], tmp)
+        run_ci(["bootstrap-text-callables"], tmp)
+
+        # Reject one bootstrap function directly via API
+        cdb = CodeIndexDbR(tmp / DB_REL)
+        cdb.reject_text_callable(
+            "codeintel.text_callable_help_json",
+            reviewer="test", note="rejected for R-G test"
+        )
+        cdb.close()
+
+        _assert("R-G: rejected function absent from v_text_callable_current after explicit reject",
+            q1(tmp,
+                "SELECT 1 FROM v_text_callable_current "
+                "WHERE qualified_name = 'codeintel.text_callable_help_json'") is None)
+
+        # Run bootstrap again — must NOT re-approve the rejected function
+        r_boot2 = run_ci(["bootstrap-text-callables"], tmp)
+        _assert("R-G: second bootstrap exits 0",
+            r_boot2.returncode == 0, r_boot2.stderr.strip())
+
+        # Must still be absent — bootstrap must not overwrite rejection
+        _assert("R-G: rejected function still absent after second bootstrap",
+            q1(tmp,
+                "SELECT 1 FROM v_text_callable_current "
+                "WHERE qualified_name = 'codeintel.text_callable_help_json'") is None)
+
+        reject_row = q1(tmp,
+            "SELECT exposure_status FROM text_callable_review tcr "
+            "JOIN code_entity ce ON ce.id = tcr.entity_id "
+            "WHERE ce.qualified_name = 'codeintel.text_callable_help_json' "
+            "ORDER BY tcr.id DESC LIMIT 1")
+        _assert("R-G: review row still rejected after second bootstrap",
+            reject_row is not None and reject_row["exposure_status"] == "rejected")
+
+    # ------------------------------------------------------------------
+    # R-H. CLI invokes approved TextCallable via generic path
+    print("\nR-H. CLI invokes approved TextCallable via generic path")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+
+        run_ci(["scan", CODEINTEL_PY], tmp)
+        run_ci(["bootstrap-text-callables"], tmp)
+
+        # text-callable-candidates must route through the TextCallable mechanism
+        r_tc = run_ci(["text-callable-candidates"], tmp)
+        _assert("R-H: text-callable-candidates exits 0",
+            r_tc.returncode == 0, r_tc.stderr.strip())
+        _assert("R-H: text-callable-candidates produces output",
+            bool(r_tc.stdout.strip()), r_tc.stdout[:200])
+
+        # text-callables must route through the TextCallable mechanism
+        r_tl = run_ci(["text-callables"], tmp)
+        _assert("R-H: text-callables exits 0",
+            r_tl.returncode == 0, r_tl.stderr.strip())
+        _assert("R-H: text-callables lists bootstrap functions",
+            "codeintel.text_callable_candidates" in r_tl.stdout,
+            r_tl.stdout[:400])
+
+        # underscore form also works
+        r_under = run_ci(["text_callable_candidates"], tmp)
+        _assert("R-H: text_callable_candidates (underscore) exits 0",
+            r_under.returncode == 0, r_under.stderr.strip())
+
+    # ------------------------------------------------------------------
+    # R-I. Help JSON includes approved TextCallables
+    print("\nR-I. Help JSON includes approved TextCallables")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+
+        run_ci(["scan", CODEINTEL_PY], tmp)
+        run_ci(["bootstrap-text-callables"], tmp)
+
+        r_help = run_ci(["text-callable-help-json"], tmp)
+        _assert("R-I: text-callable-help-json exits 0",
+            r_help.returncode == 0, r_help.stderr.strip())
+
+        parsed = None
+        try:
+            parsed = json.loads(r_help.stdout)
+            _assert("R-I: text-callable-help-json parses as JSON", True)
+        except json.JSONDecodeError as exc:
+            _assert("R-I: text-callable-help-json parses as JSON", False, str(exc))
+
+        if parsed is not None:
+            _assert("R-I: help JSON is a list", isinstance(parsed, list))
+            _assert("R-I: help JSON has entries", len(parsed) >= 4)
+
+            commands_present = {e.get("command") for e in parsed}
+            for expected in (
+                "text_callable_candidates",
+                "text_callables",
+                "approve_text_callable",
+                "reject_text_callable",
+            ):
+                _assert(f"R-I: help JSON includes {expected}",
+                    expected in commands_present,
+                    str(sorted(commands_present)))
+
+            # Each entry should have at least command, aliases, parameters
+            for entry in parsed:
+                cmd_name = entry.get("command", "")
+                _assert(f"R-I: {cmd_name} entry has aliases key",
+                    "aliases" in entry)
+                _assert(f"R-I: {cmd_name} entry has parameters key",
+                    "parameters" in entry)
+                _assert(f"R-I: {cmd_name} entry has qualified_name",
+                    "qualified_name" in entry)
+
+
+# ---------------------------------------------------------------------------
 
 
 def main() -> None:
@@ -2088,6 +2459,7 @@ def main() -> None:
     test_text_callable_command_registry()
     test_text_callable_from_row()
     test_text_callable_union_isolation()
+    test_text_callable_self_hosting()
 
     total  = len(_results)
     passed = sum(1 for _, ok, _ in _results if ok)

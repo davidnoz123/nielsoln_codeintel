@@ -35,6 +35,17 @@ SCHEMA_VERSION = "1.3.0"
 SCANNER_VERSION = "codeintel 1.3.0"
 DEFAULT_DB_PATH = Path(".codeintel") / "codeintel.sqlite"
 
+# Qualified names approved during bootstrap — the minimal hard-coded seed.
+# Once bootstrapped, these functions obey the same hash-freshness rules as
+# every other approved TextCallable.
+BOOTSTRAP_TEXT_CALLABLE_QNAMES: frozenset = frozenset({
+    "codeintel.text_callable_candidates",
+    "codeintel.text_callables",
+    "codeintel.approve_text_callable",
+    "codeintel.reject_text_callable",
+    "codeintel.text_callable_help_json",
+})
+
 # ---------------------------------------------------------------------------
 # Embedded schema — v1.2.0 / v1.3.0
 # Note: entity_location.detection_method has NO DEFAULT.
@@ -1555,6 +1566,296 @@ class CodeIndexDb:
     def query(self, sql: str, params: tuple = ()) -> List[sqlite3.Row]:
         return self._conn.execute(sql, params).fetchall()
 
+    # ------------------------------------------------------------------
+    # TextCallable review operations
+
+    # SQL fragment that fetches a candidate row with its latest hashes.
+    _CANDIDATE_HASH_SQL = (
+        "SELECT vtc.entity_id, vtc.qualified_name, vtc.name, "
+        "       COALESCE(bh.hash_value, '') AS body_hash, "
+        "       COALESCE(sh.hash_value, '') AS signature_hash, "
+        "       CASE WHEN et_doc.text_body IS NOT NULL THEN 1 ELSE 0 END AS has_docstring "
+        "FROM v_text_callable_candidate vtc "
+        "LEFT JOIN entity_hash bh "
+        "    ON bh.entity_id = vtc.entity_id AND bh.hash_kind = 'body_sha256' "
+        "    AND bh.scan_run_id = ("
+        "        SELECT MAX(eh2.scan_run_id) FROM entity_hash eh2 "
+        "        WHERE eh2.entity_id = vtc.entity_id AND eh2.hash_kind = 'body_sha256'"
+        "    ) "
+        "LEFT JOIN entity_hash sh "
+        "    ON sh.entity_id = vtc.entity_id AND sh.hash_kind = 'signature_sha256' "
+        "    AND sh.scan_run_id = ("
+        "        SELECT MAX(eh2.scan_run_id) FROM entity_hash eh2 "
+        "        WHERE eh2.entity_id = vtc.entity_id AND eh2.hash_kind = 'signature_sha256'"
+        "    ) "
+        "LEFT JOIN entity_text et_doc "
+        "    ON et_doc.entity_id = vtc.entity_id AND et_doc.text_kind = 'docstring' "
+    )
+
+    def list_text_callable_candidates(
+        self, name_filter: str = ""
+    ) -> List[sqlite3.Row]:
+        """Return candidate rows with latest hashes and current review status."""
+        base = (
+            "SELECT vtc.entity_id, vtc.qualified_name, vtc.name, vtc.entity_type, "
+            "       vtc.file_path, vtc.start_line, vtc.end_line, vtc.language, "
+            "       COALESCE(bh.hash_value, '') AS body_hash, "
+            "       COALESCE(sh.hash_value, '') AS signature_hash, "
+            "       CASE WHEN et_doc.text_body IS NOT NULL THEN 1 ELSE 0 END "
+            "           AS docstring_present, "
+            "       tcr_latest.exposure_status AS current_review_status "
+            "FROM v_text_callable_candidate vtc "
+            "LEFT JOIN entity_hash bh "
+            "    ON bh.entity_id = vtc.entity_id AND bh.hash_kind = 'body_sha256' "
+            "    AND bh.scan_run_id = ("
+            "        SELECT MAX(eh2.scan_run_id) FROM entity_hash eh2 "
+            "        WHERE eh2.entity_id = vtc.entity_id AND eh2.hash_kind = 'body_sha256'"
+            "    ) "
+            "LEFT JOIN entity_hash sh "
+            "    ON sh.entity_id = vtc.entity_id AND sh.hash_kind = 'signature_sha256' "
+            "    AND sh.scan_run_id = ("
+            "        SELECT MAX(eh2.scan_run_id) FROM entity_hash eh2 "
+            "        WHERE eh2.entity_id = vtc.entity_id AND eh2.hash_kind = 'signature_sha256'"
+            "    ) "
+            "LEFT JOIN entity_text et_doc "
+            "    ON et_doc.entity_id = vtc.entity_id AND et_doc.text_kind = 'docstring' "
+            "LEFT JOIN text_callable_review tcr_latest "
+            "    ON tcr_latest.id = ("
+            "        SELECT MAX(tcr2.id) FROM text_callable_review tcr2 "
+            "        WHERE tcr2.entity_id = vtc.entity_id"
+            "    ) "
+        )
+        if name_filter:
+            escaped = _like_escape(name_filter)
+            return self.query(
+                base + (
+                    "WHERE (vtc.qualified_name LIKE ? ESCAPE '\\' "
+                    "    OR vtc.name LIKE ? ESCAPE '\\') "
+                    "ORDER BY vtc.qualified_name"
+                ),
+                (f"%{escaped}%", f"%{escaped}%"),
+            )
+        return self.query(base + "ORDER BY vtc.qualified_name")
+
+    def list_current_text_callables(
+        self, name_filter: str = ""
+    ) -> List[sqlite3.Row]:
+        """Return approved, hash-fresh TextCallable rows from v_text_callable_current."""
+        base = (
+            "SELECT vtc.review_id, vtc.entity_id, vtc.qualified_name, vtc.name, "
+            "       vtc.entity_type, vtc.file_path, vtc.start_line, vtc.end_line, "
+            "       vtc.language, vtc.docstring_status, vtc.arg_textish_status, "
+            "       vtc.return_textish_status, vtc.exposure_status, "
+            "       vtc.review_note, vtc.reviewed_by, vtc.reviewed_at "
+            "FROM v_text_callable_current vtc "
+        )
+        if name_filter:
+            escaped = _like_escape(name_filter)
+            return self.query(
+                base + (
+                    "WHERE (vtc.qualified_name LIKE ? ESCAPE '\\' "
+                    "    OR vtc.name LIKE ? ESCAPE '\\') "
+                    "ORDER BY vtc.qualified_name"
+                ),
+                (f"%{escaped}%", f"%{escaped}%"),
+            )
+        return self.query(base + "ORDER BY vtc.qualified_name")
+
+    def _find_candidate_with_hashes(
+        self, qualified_name: str
+    ) -> Optional[sqlite3.Row]:
+        """
+        Return the candidate row (with latest hashes) for qualified_name, or None.
+        Raises CommandError if multiple candidates match (cross-branch edge case).
+        """
+        rows = self.query(
+            self._CANDIDATE_HASH_SQL + "WHERE vtc.qualified_name = ?",
+            (qualified_name,),
+        )
+        if not rows:
+            return None
+        if len(rows) > 1:
+            raise CommandError(
+                f"multiple candidates found for {qualified_name!r} "
+                "(cross-branch conflict — specify db_path explicitly)"
+            )
+        return rows[0]
+
+    def _upsert_text_callable_review(
+        self,
+        entity_id: int,
+        sig_hash: str,
+        body_hash: str,
+        docstring_status: str,
+        exposure_status: str,
+        reviewer: str,
+        note: str,
+    ) -> None:
+        """
+        Insert or update the latest text_callable_review row for entity_id.
+
+        Updates the most-recent row (highest id) if one exists; inserts if not.
+        This keeps one authoritative review row per entity while allowing
+        approve/reject to override a prior decision.
+        """
+        existing = self._conn.execute(
+            "SELECT id FROM text_callable_review "
+            "WHERE entity_id = ? ORDER BY id DESC LIMIT 1",
+            (entity_id,),
+        ).fetchone()
+        if existing is None:
+            self._conn.execute(
+                "INSERT INTO text_callable_review "
+                "(entity_id, signature_hash, body_hash, docstring_status, "
+                " arg_textish_status, return_textish_status, exposure_status, "
+                " review_note, reviewed_by, reviewed_at) "
+                "VALUES (?, ?, ?, ?, 'textish', 'textish', ?, ?, ?, ?)",
+                (
+                    entity_id, sig_hash, body_hash, docstring_status,
+                    exposure_status, note or None, reviewer or None, _utcnow(),
+                ),
+            )
+        else:
+            self._conn.execute(
+                "UPDATE text_callable_review "
+                "SET signature_hash = ?, body_hash = ?, "
+                "    docstring_status = ?, "
+                "    arg_textish_status = 'textish', "
+                "    return_textish_status = 'textish', "
+                "    exposure_status = ?, "
+                "    review_note = ?, reviewed_by = ?, reviewed_at = ? "
+                "WHERE id = ?",
+                (
+                    sig_hash, body_hash, docstring_status,
+                    exposure_status, note or None, reviewer or None, _utcnow(),
+                    existing["id"],
+                ),
+            )
+
+    def approve_text_callable(
+        self,
+        qualified_name: str,
+        reviewer: str = "",
+        note: str = "",
+    ) -> str:
+        """Approve a TextCallable candidate.  Returns a short confirmation string."""
+        row = self._find_candidate_with_hashes(qualified_name)
+        if row is None:
+            raise CommandError(
+                f"no TextCallable candidate found: {qualified_name!r}  "
+                "(run 'scan' first, or check the qualified name)"
+            )
+        body_hash = row["body_hash"]
+        sig_hash = row["signature_hash"]
+        if not body_hash:
+            raise CommandError(
+                f"candidate has no body hash: {qualified_name!r}  "
+                "(re-run 'scan' to populate hashes)"
+            )
+        if not sig_hash:
+            raise CommandError(
+                f"candidate has no signature hash: {qualified_name!r}  "
+                "(re-run 'scan' to populate hashes)"
+            )
+        docstring_status = "reviewed" if row["has_docstring"] else "missing"
+        self._upsert_text_callable_review(
+            entity_id=row["entity_id"],
+            sig_hash=sig_hash,
+            body_hash=body_hash,
+            docstring_status=docstring_status,
+            exposure_status="approved",
+            reviewer=reviewer,
+            note=note,
+        )
+        self._conn.commit()
+        return f"approved: {qualified_name}"
+
+    def reject_text_callable(
+        self,
+        qualified_name: str,
+        reviewer: str = "",
+        note: str = "",
+    ) -> str:
+        """Reject a TextCallable candidate.  Returns a short confirmation string."""
+        row = self._find_candidate_with_hashes(qualified_name)
+        if row is None:
+            raise CommandError(
+                f"no TextCallable candidate found: {qualified_name!r}  "
+                "(run 'scan' first, or check the qualified name)"
+            )
+        body_hash = row["body_hash"]
+        sig_hash = row["signature_hash"]
+        if not body_hash:
+            raise CommandError(
+                f"candidate has no body hash: {qualified_name!r}"
+            )
+        if not sig_hash:
+            raise CommandError(
+                f"candidate has no signature hash: {qualified_name!r}"
+            )
+        docstring_status = "reviewed" if row["has_docstring"] else "missing"
+        self._upsert_text_callable_review(
+            entity_id=row["entity_id"],
+            sig_hash=sig_hash,
+            body_hash=body_hash,
+            docstring_status=docstring_status,
+            exposure_status="rejected",
+            reviewer=reviewer,
+            note=note,
+        )
+        self._conn.commit()
+        return f"rejected: {qualified_name}"
+
+    def bootstrap_text_callables(
+        self, qnames: frozenset
+    ) -> Tuple[List[str], List[str]]:
+        """
+        Seed approval rows for each qualified name in qnames.
+
+        Only inserts a row when no existing text_callable_review row exists
+        for that entity_id.  Does NOT overwrite approved, rejected, or stale
+        rows.  Returns (approved_list, skipped_list).
+        """
+        approved: List[str] = []
+        skipped: List[str] = []
+
+        for qname in sorted(qnames):
+            row = self._find_candidate_with_hashes(qname)
+            if row is None:
+                skipped.append(f"{qname} (not found in candidates — scan first)")
+                continue
+
+            body_hash = row["body_hash"]
+            sig_hash = row["signature_hash"]
+            if not body_hash or not sig_hash:
+                skipped.append(f"{qname} (missing hashes — re-run scan)")
+                continue
+
+            existing = self._conn.execute(
+                "SELECT id, exposure_status FROM text_callable_review "
+                "WHERE entity_id = ? ORDER BY id DESC LIMIT 1",
+                (row["entity_id"],),
+            ).fetchone()
+            if existing is not None:
+                skipped.append(
+                    f"{qname} (review exists: {existing['exposure_status']})"
+                )
+                continue
+
+            docstring_status = "reviewed" if row["has_docstring"] else "missing"
+            self._conn.execute(
+                "INSERT INTO text_callable_review "
+                "(entity_id, signature_hash, body_hash, docstring_status, "
+                " arg_textish_status, return_textish_status, exposure_status, "
+                " review_note, reviewed_by, reviewed_at) "
+                "VALUES (?, ?, ?, ?, 'textish', 'textish', 'approved', "
+                " 'bootstrap seed', 'bootstrap', ?)",
+                (row["entity_id"], sig_hash, body_hash, docstring_status, _utcnow()),
+            )
+            approved.append(qname)
+
+        return approved, skipped
+
 
 # ---------------------------------------------------------------------------
 # LanguageExtractor — plug-in seam
@@ -2828,6 +3129,11 @@ def _open_db(require_existing: bool = False) -> CodeIndexDb:
             "no database found.  Run:  python codeintel.py scan <path>"
         )
     return CodeIndexDb(db_path)
+
+
+def _resolve_db_path(db_path: str) -> Path:
+    """Return the DB path to use: db_path argument if non-empty, else DEFAULT_DB_PATH."""
+    return Path(db_path) if db_path else DEFAULT_DB_PATH
 
 
 # ---------------------------------------------------------------------------
@@ -4435,27 +4741,243 @@ class TextCallableCommandRegistry:
 
 
 # ---------------------------------------------------------------------------
+# TextCallable management functions
+#
+# These are ordinary top-level Python functions that are themselves eligible
+# TextCallable candidates.  After 'bootstrap-text-callables' is run, they
+# appear in v_text_callable_current and become callable through the generic
+# CLI invocation path — no bespoke CLI handlers required.
+# ---------------------------------------------------------------------------
+
+
+def text_callable_candidates(
+    db_path: str = "",
+    name_filter: str = "",
+    json_output: bool = False,
+) -> str:
+    """List TextCallable candidate functions.
+
+    Reads from v_text_callable_candidate and includes the latest body and
+    signature hashes plus any existing review status.  Pass name_filter to
+    restrict results by qualified name or bare name (LIKE match).
+    """
+    db = CodeIndexDb(_resolve_db_path(db_path))
+    try:
+        rows = db.list_text_callable_candidates(name_filter)
+    finally:
+        db.close()
+
+    if json_output:
+        return json.dumps([dict(r) for r in rows], indent=2, default=str)
+
+    if not rows:
+        msg = "No TextCallable candidates found."
+        if name_filter:
+            msg = f"No TextCallable candidates matching {name_filter!r}."
+        return msg
+
+    lines = [f"TextCallable candidates ({len(rows)}):"]
+    for row in rows:
+        rev = row["current_review_status"] or "-"
+        doc = "yes" if row["docstring_present"] else "no"
+        bh = (row["body_hash"] or "")[:10] or "-"
+        sh = (row["signature_hash"] or "")[:10] or "-"
+        fp = row["file_path"] or ""
+        loc = f"{fp}:{row['start_line']}-{row['end_line']}" if fp else "-"
+        lines.append(
+            f"  {row['qualified_name']}  [{row['entity_type']}]"
+            f"  docstring={doc}  review={rev}"
+            f"  body={bh}  sig={sh}  @ {loc}"
+        )
+    return "\n".join(lines)
+
+
+def text_callables(
+    db_path: str = "",
+    name_filter: str = "",
+    json_output: bool = False,
+) -> str:
+    """List currently approved, hash-fresh TextCallables.
+
+    Reads from v_text_callable_current.  Only functions whose body and
+    signature hashes still match the reviewed hashes are shown.
+    """
+    db = CodeIndexDb(_resolve_db_path(db_path))
+    try:
+        rows = db.list_current_text_callables(name_filter)
+    finally:
+        db.close()
+
+    if json_output:
+        return json.dumps([dict(r) for r in rows], indent=2, default=str)
+
+    if not rows:
+        msg = "No approved TextCallables found."
+        if name_filter:
+            msg = f"No approved TextCallables matching {name_filter!r}."
+        return msg
+
+    lines = [f"Approved TextCallables ({len(rows)}):"]
+    for row in rows:
+        fp = row["file_path"] or ""
+        loc = f"{fp}:{row['start_line']}-{row['end_line']}" if fp else "-"
+        lines.append(
+            f"  {row['qualified_name']}  [{row['entity_type']}]"
+            f"  reviewed_by={row['reviewed_by'] or '-'}"
+            f"  reviewed_at={row['reviewed_at'] or '-'}  @ {loc}"
+        )
+    return "\n".join(lines)
+
+
+def approve_text_callable(
+    qualified_name: str,
+    reviewer: str = "",
+    note: str = "",
+    db_path: str = "",
+) -> str:
+    """Approve a TextCallable candidate by qualified name.
+
+    Looks up the candidate in v_text_callable_candidate, records the current
+    body and signature hashes in text_callable_review with status 'approved',
+    and returns a confirmation string.
+    """
+    db = CodeIndexDb(_resolve_db_path(db_path))
+    try:
+        return db.approve_text_callable(
+            qualified_name, reviewer=reviewer, note=note
+        )
+    finally:
+        db.close()
+
+
+def reject_text_callable(
+    qualified_name: str,
+    reviewer: str = "",
+    note: str = "",
+    db_path: str = "",
+) -> str:
+    """Reject a TextCallable candidate by qualified name.
+
+    Records a rejection row in text_callable_review.  Rejected functions
+    do not appear in v_text_callable_current.
+    """
+    db = CodeIndexDb(_resolve_db_path(db_path))
+    try:
+        return db.reject_text_callable(
+            qualified_name, reviewer=reviewer, note=note
+        )
+    finally:
+        db.close()
+
+
+def text_callable_help_json(db_path: str = "") -> str:
+    """Return help JSON for all currently approved TextCallables.
+
+    Produces JSON in the same style as help-json.  Each entry includes
+    command name, aliases, parameters, summary, long description, qualified
+    name, and source location.  Introspects live function signatures via
+    inspect when the function is available in this module.
+    """
+    db = CodeIndexDb(_resolve_db_path(db_path))
+    try:
+        rows = db.list_current_text_callables()
+    finally:
+        db.close()
+
+    current_globals = globals()
+    payload: List[Dict[str, Any]] = []
+    for row in rows:
+        func_name = row["name"]
+        func = current_globals.get(func_name)
+        if func is not None:
+            dash_name = func_name.replace("_", "-")
+            spec = _CommandSpec(func_name, func, aliases=(dash_name,))
+            entry = spec.describe()
+        else:
+            dash_name = func_name.replace("_", "-")
+            entry = {
+                "command": func_name,
+                "aliases": [dash_name],
+                "parameters": [],
+                "summary": "",
+                "long_description": "",
+            }
+        entry["qualified_name"] = row["qualified_name"]
+        entry["file_path"] = row["file_path"] or ""
+        entry["start_line"] = row["start_line"]
+        entry["end_line"] = row["end_line"]
+        payload.append(entry)
+
+    return json.dumps(payload, indent=2, default=str)
+
+
+# ---------------------------------------------------------------------------
+# bootstrap-text-callables — built-in seed command
+# ---------------------------------------------------------------------------
+
+
+def bootstrap_text_callables() -> str:
+    """Seed approval for the CodeIntel TextCallable management functions.
+
+    Approves the bootstrap set of TextCallable management functions using
+    their current scanned body and signature hashes.  Only inserts a review
+    row when no existing row exists for that qualified name — existing
+    approved, rejected, or stale rows are not overwritten.
+
+    Run 'scan <path/to/codeintel.py>' before bootstrapping so that the
+    management functions appear in v_text_callable_candidate with fresh
+    hashes.
+    """
+    db = _open_db(require_existing=True)
+    try:
+        approved, skipped = db.bootstrap_text_callables(
+            BOOTSTRAP_TEXT_CALLABLE_QNAMES
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    lines = ["bootstrap-text-callables:"]
+    for qn in approved:
+        lines.append(f"  approved : {qn}")
+    for qn in skipped:
+        lines.append(f"  skipped  : {qn}")
+    if not approved and not skipped:
+        lines.append(
+            "  (no bootstrap candidates found — "
+            "run 'scan' on codeintel.py first)"
+        )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Publication mapping — the explicit source of command truth
 # ---------------------------------------------------------------------------
 
 PUBLISHED_COMMANDS: Dict[str, Callable] = {
-    "scan":             scan,
-    "find":             find,
-    "orient":           orient,
-    "status":           status,
-    "stale":            stale,
-    "drifts":           drifts,
-    "ack-drift":        ack_drift,
-    "ack_drift":        ack_drift,
-    "ignore-drift":     ignore_drift,
-    "ignore_drift":     ignore_drift,
-    "commands":         commands,
-    "help-json":        help_json,
-    "help_json":        help_json,
-    "map":              map_repo,
-    "map_repo":         map_repo,
-    "validate-source":  validate_source,
-    "validate_source":  validate_source,
+    "scan":                     scan,
+    "find":                     find,
+    "orient":                   orient,
+    "status":                   status,
+    "stale":                    stale,
+    "drifts":                   drifts,
+    "ack-drift":                ack_drift,
+    "ack_drift":                ack_drift,
+    "ignore-drift":             ignore_drift,
+    "ignore_drift":             ignore_drift,
+    "commands":                 commands,
+    "help-json":                help_json,
+    "help_json":                help_json,
+    "map":                      map_repo,
+    "map_repo":                 map_repo,
+    "validate-source":          validate_source,
+    "validate_source":          validate_source,
+    # bootstrap-text-callables is a built-in: it solves the chicken-and-egg
+    # problem of approving the management functions before any TextCallable is
+    # approved.  The 5 management functions themselves are NOT listed here —
+    # they are exposed generically through v_text_callable_current.
+    "bootstrap-text-callables": bootstrap_text_callables,
+    "bootstrap_text_callables": bootstrap_text_callables,
 }
 
 
@@ -4469,9 +4991,107 @@ def build_registry() -> PublishedCommandRegistry:
     return _registry()
 
 
+def _try_invoke_text_callable(
+    command_token: str, rest: List[str]
+) -> Optional[int]:
+    """
+    Look up command_token in v_text_callable_current; invoke if found.
+
+    Normalises the token to both underscore and dash forms before lookup.
+    Finds the function in this module's globals by bare function name.
+    Uses PublishedCommandRegistry._bind for argument parsing.
+
+    Returns an exit code int (0 = success, 1 = error) if the command was
+    found and handled, or None if no matching approved TextCallable exists.
+    """
+    name_variants = {
+        command_token,
+        command_token.replace("-", "_"),
+        command_token.replace("_", "-"),
+    }
+
+    try:
+        db = CodeIndexDb(DEFAULT_DB_PATH)
+        rows = db.list_current_text_callables()
+        db.close()
+    except Exception:
+        return None
+
+    matched_row = None
+    for row in rows:
+        if row["name"] in name_variants:
+            matched_row = row
+            break
+
+    if matched_row is None:
+        return None
+
+    func_name = matched_row["name"]
+    func = globals().get(func_name)
+    if func is None:
+        print(
+            f"TextCallable command failed: {func_name}",
+            file=sys.stderr,
+        )
+        print(
+            f"Reason: function {func_name!r} not found in module globals",
+            file=sys.stderr,
+        )
+        return 1
+
+    spec = _CommandSpec(func_name, func)
+    _tmp_reg = PublishedCommandRegistry()
+
+    try:
+        bound = _tmp_reg._bind(spec, rest)
+    except CommandError as exc:
+        print(f"TextCallable command failed: {func_name}", file=sys.stderr)
+        print(f"Reason: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        result = func(**bound)
+    except CommandError as exc:
+        print(f"TextCallable command failed: {func_name}", file=sys.stderr)
+        print(f"Reason: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(f"TextCallable command failed: {func_name}", file=sys.stderr)
+        print(f"Reason: {exc}", file=sys.stderr)
+        return 1
+
+    if isinstance(result, str):
+        if result:
+            print(result)
+    elif isinstance(result, (dict, list)):
+        print(json.dumps(result, indent=2, default=str))
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
+    args = sys.argv[1:] if argv is None else argv
     registry = build_registry()
-    return registry.run(sys.argv[1:] if argv is None else argv)
+
+    if not args:
+        registry.print_usage()
+        return 0
+
+    command_token = args[0]
+
+    # 1. Built-in commands take precedence over TextCallable commands.
+    spec = registry.resolve(command_token)
+    if spec is not None:
+        return registry.run(args)
+
+    # 2. Fall through to approved TextCallable commands when the DB exists.
+    if DEFAULT_DB_PATH.exists():
+        exit_code = _try_invoke_text_callable(command_token, args[1:])
+        if exit_code is not None:
+            return exit_code
+
+    # 3. Unknown command.
+    registry.print_usage(unknown=command_token)
+    return 1
 
 
 if __name__ == "__main__":
