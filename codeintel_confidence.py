@@ -2431,6 +2431,192 @@ def test_text_callable_self_hosting() -> None:
                 _assert(f"R-I: {cmd_name} entry has qualified_name",
                     "qualified_name" in entry)
 
+    # ------------------------------------------------------------------
+    # R-J. Signature eligibility: textish checker gates v_text_callable_current
+    print("\nR-J. Signature eligibility checks")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+
+        (tmp / "sigtest.py").write_text(textwrap.dedent("""\
+            from typing import Optional
+
+            def good_func(name: str = "") -> str:
+                \"\"\"All str params, str return.\"\"\"
+                return name
+
+            def bool_param(flag: bool = False) -> str:
+                \"\"\"Bool param, str return.\"\"\"
+                return str(flag)
+
+            def int_param(n: int = 0) -> str:
+                \"\"\"Int param, str return.\"\"\"
+                return str(n)
+
+            def optional_str(x: Optional[str] = None) -> str:
+                \"\"\"Optional[str] param, str return.\"\"\"
+                return x or ""
+
+            def list_param(items: list) -> str:
+                \"\"\"Has a list parameter — not textish.\"\"\"
+                return str(items)
+
+            def dict_param(data: dict) -> str:
+                \"\"\"Has a dict parameter — not textish.\"\"\"
+                return str(data)
+
+            def starargs_func(*args) -> str:
+                \"\"\"Has *args — not textish.\"\"\"
+                return str(args)
+
+            def kwargs_func(**kwargs) -> str:
+                \"\"\"Has **kwargs — not textish.\"\"\"
+                return str(kwargs)
+
+            def unannotated_param(x) -> str:
+                \"\"\"Unannotated parameter — unknown.\"\"\"
+                return str(x)
+
+            def no_return_annotation(x: str):
+                \"\"\"No return annotation — unknown return.\"\"\"
+                return x
+
+            def path_param(p: object) -> str:
+                \"\"\"object-typed parameter — not textish.\"\"\"
+                return str(p)
+        """), encoding="utf-8")
+
+        run_ci(["scan", str(tmp)], tmp)
+
+        cdb = CodeIndexDbR(tmp / DB_REL)
+
+        def _approve_and_get_status(qname):
+            try:
+                cdb.approve_text_callable(qname, reviewer="test")
+            except Exception as exc:
+                return None, None
+            rows = cdb.query(
+                "SELECT arg_textish_status, return_textish_status "
+                "FROM text_callable_review tcr "
+                "JOIN code_entity ce ON ce.id = tcr.entity_id "
+                "WHERE ce.qualified_name = ?",
+                (qname,),
+            )
+            if rows:
+                return rows[0]["arg_textish_status"], rows[0]["return_textish_status"]
+            return None, None
+
+        def _in_current(qname):
+            return len(cdb.query(
+                "SELECT 1 FROM v_text_callable_current WHERE qualified_name = ?",
+                (qname,),
+            )) > 0
+
+        # --- Textish cases: should appear in current after approval ---
+
+        arg_s, ret_s = _approve_and_get_status("sigtest.good_func")
+        _assert("R-J: good_func arg_textish = textish", arg_s == "textish", arg_s)
+        _assert("R-J: good_func ret_textish = textish", ret_s == "textish", ret_s)
+        _assert("R-J: good_func IN v_text_callable_current",
+            _in_current("sigtest.good_func"))
+
+        arg_s, ret_s = _approve_and_get_status("sigtest.bool_param")
+        _assert("R-J: bool_param arg_textish = textish", arg_s == "textish", arg_s)
+        _assert("R-J: bool_param IN v_text_callable_current",
+            _in_current("sigtest.bool_param"))
+
+        arg_s, ret_s = _approve_and_get_status("sigtest.int_param")
+        _assert("R-J: int_param arg_textish = textish", arg_s == "textish", arg_s)
+        _assert("R-J: int_param IN v_text_callable_current",
+            _in_current("sigtest.int_param"))
+
+        arg_s, ret_s = _approve_and_get_status("sigtest.optional_str")
+        _assert("R-J: optional_str arg_textish = textish", arg_s == "textish", arg_s)
+        _assert("R-J: optional_str IN v_text_callable_current",
+            _in_current("sigtest.optional_str"))
+
+        # --- Not-textish cases: approved but blocked by view ---
+
+        arg_s, ret_s = _approve_and_get_status("sigtest.list_param")
+        _assert("R-J: list_param arg_textish = not_textish",
+            arg_s == "not_textish", arg_s)
+        _assert("R-J: list_param NOT in v_text_callable_current after approval",
+            not _in_current("sigtest.list_param"))
+
+        arg_s, ret_s = _approve_and_get_status("sigtest.dict_param")
+        _assert("R-J: dict_param arg_textish = not_textish",
+            arg_s == "not_textish", arg_s)
+        _assert("R-J: dict_param NOT in v_text_callable_current after approval",
+            not _in_current("sigtest.dict_param"))
+
+        arg_s, ret_s = _approve_and_get_status("sigtest.starargs_func")
+        _assert("R-J: starargs_func arg_textish = not_textish",
+            arg_s == "not_textish", arg_s)
+        _assert("R-J: starargs_func NOT in v_text_callable_current after approval",
+            not _in_current("sigtest.starargs_func"))
+
+        arg_s, ret_s = _approve_and_get_status("sigtest.kwargs_func")
+        _assert("R-J: kwargs_func arg_textish = not_textish",
+            arg_s == "not_textish", arg_s)
+        _assert("R-J: kwargs_func NOT in v_text_callable_current after approval",
+            not _in_current("sigtest.kwargs_func"))
+
+        arg_s, ret_s = _approve_and_get_status("sigtest.path_param")
+        _assert("R-J: path_param (object type) arg_textish = not_textish",
+            arg_s == "not_textish", arg_s)
+        _assert("R-J: path_param NOT in v_text_callable_current after approval",
+            not _in_current("sigtest.path_param"))
+
+        # --- Unknown cases: approved but blocked by view ---
+
+        arg_s, ret_s = _approve_and_get_status("sigtest.unannotated_param")
+        _assert("R-J: unannotated_param arg_textish = unknown",
+            arg_s == "unknown", arg_s)
+        _assert("R-J: unannotated_param NOT in v_text_callable_current",
+            not _in_current("sigtest.unannotated_param"))
+
+        arg_s, ret_s = _approve_and_get_status("sigtest.no_return_annotation")
+        _assert("R-J: no_return_annotation ret_textish = unknown",
+            ret_s == "unknown", ret_s)
+        _assert("R-J: no_return_annotation NOT in v_text_callable_current",
+            not _in_current("sigtest.no_return_annotation"))
+
+        cdb.close()
+
+    # ------------------------------------------------------------------
+    # R-K. Bootstrap management functions pass the signature checker
+    print("\nR-K. Bootstrap functions pass signature checker")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+
+        run_ci(["scan", CODEINTEL_PY], tmp)
+        run_ci(["bootstrap-text-callables"], tmp)
+
+        bootstrap_qnames = [
+            "codeintel.text_callable_candidates",
+            "codeintel.text_callables",
+            "codeintel.approve_text_callable",
+            "codeintel.reject_text_callable",
+            "codeintel.text_callable_help_json",
+        ]
+        cdb = CodeIndexDbR(tmp / DB_REL)
+        for qname in bootstrap_qnames:
+            rows = cdb.query(
+                "SELECT arg_textish_status, return_textish_status "
+                "FROM text_callable_review tcr "
+                "JOIN code_entity ce ON ce.id = tcr.entity_id "
+                "WHERE ce.qualified_name = ?",
+                (qname,),
+            )
+            _assert(f"R-K: {qname} has review row", len(rows) > 0)
+            if rows:
+                _assert(f"R-K: {qname} arg_textish_status = textish",
+                    rows[0]["arg_textish_status"] == "textish",
+                    rows[0]["arg_textish_status"])
+                _assert(f"R-K: {qname} return_textish_status = textish",
+                    rows[0]["return_textish_status"] == "textish",
+                    rows[0]["return_textish_status"])
+        cdb.close()
+
 
 # ---------------------------------------------------------------------------
 

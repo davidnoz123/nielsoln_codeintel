@@ -894,6 +894,129 @@ def _extract_py_header(node, lines: List[str]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# TextCallable signature eligibility helpers
+# ---------------------------------------------------------------------------
+
+_TEXTISH_SCALAR_NAMES: frozenset = frozenset({"str", "int", "float", "bool"})
+
+
+def _annotation_textish(node: object) -> str:
+    """
+    Classify one AST annotation node.
+
+    Returns
+    -------
+    'textish'     str / int / float / bool, or Optional[one of those]
+    'not_textish' any other recognisable type expression
+    'unknown'     absent (None) annotation
+    """
+    if node is None:
+        return "unknown"
+
+    # Simple name: str, int, float, bool → textish; anything else → not_textish
+    if isinstance(node, ast.Name):
+        return "textish" if node.id in _TEXTISH_SCALAR_NAMES else "not_textish"
+
+    # Subscript: Optional[X] → recurse on the inner type.
+    # typing.Optional[X] is also handled via the attr check.
+    # Any other subscript (List[...], Dict[...], Tuple[...], etc.) → not_textish.
+    if isinstance(node, ast.Subscript):
+        outer = node.value
+        is_optional = (
+            (isinstance(outer, ast.Name) and outer.id == "Optional")
+            or (isinstance(outer, ast.Attribute) and outer.attr == "Optional")
+        )
+        if is_optional:
+            inner = node.slice
+            # Python 3.8 wraps the slice in ast.Index; 3.9+ uses the node
+            # directly.  Unwrap safely without importing ast.Index.
+            inner = getattr(inner, "value", inner)
+            return _annotation_textish(inner)
+        return "not_textish"
+
+    # Constant (e.g. None literal, forward-reference string) → unknown
+    if isinstance(node, ast.Constant):
+        return "unknown"
+
+    # BinOp: Python 3.10+ union syntax (X | Y) — conservative unknown for now.
+    if isinstance(node, ast.BinOp):
+        return "unknown"
+
+    # Anything else (Attribute, Tuple, etc.) → not_textish
+    return "not_textish"
+
+
+def _check_signature_textish(signature_text: str) -> Tuple[str, str]:
+    """
+    Parse the stored function signature text and classify its argument and
+    return-type compatibility for text-only invocation.
+
+    Returns
+    -------
+    (arg_textish_status, return_textish_status)
+    Each is one of ``'textish'``, ``'not_textish'``, or ``'unknown'``.
+
+    Rules
+    -----
+    arg_textish_status
+        'textish'      every parameter is annotated with a scalar or Optional
+                       thereof; no ``*args`` or ``**kwargs``
+        'not_textish'  *args/**kwargs present, or any parameter has a type
+                       annotation that is not a text-compatible scalar
+        'unknown'      one or more parameters have no annotation (but none is
+                       actively non-textish); no *args/**kwargs
+
+    return_textish_status
+        derived from the return annotation by the same annotation classifier;
+        'unknown' when there is no return annotation
+
+    Returns ``('unknown', 'unknown')`` when the text cannot be parsed.
+    """
+    text = (signature_text or "").strip()
+    if not text:
+        return "unknown", "unknown"
+
+    try:
+        stub = text + "\n    pass"
+        tree = ast.parse(stub)
+    except SyntaxError:
+        return "unknown", "unknown"
+
+    fn_nodes = [
+        n for n in ast.walk(tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    if not fn_nodes:
+        return "unknown", "unknown"
+
+    fn = fn_nodes[0]
+    args = fn.args
+
+    # *args / **kwargs → immediately not_textish for arguments
+    if args.vararg is not None or args.kwarg is not None:
+        return "not_textish", "unknown"
+
+    all_params = (
+        list(args.posonlyargs)
+        + list(args.args)
+        + list(args.kwonlyargs)
+    )
+
+    arg_status = "textish"
+    for param in all_params:
+        pstatus = _annotation_textish(param.annotation)
+        if pstatus == "not_textish":
+            # One non-textish parameter taints the whole function.
+            return "not_textish", "unknown"
+        if pstatus == "unknown":
+            # Degrade from textish → unknown but keep checking.
+            arg_status = "unknown"
+
+    ret_status = _annotation_textish(fn.returns)
+    return arg_status, ret_status
+
+
+# ---------------------------------------------------------------------------
 # CodeIndexDb — persistence layer
 # ---------------------------------------------------------------------------
 
@@ -1681,6 +1804,15 @@ class CodeIndexDb:
             )
         return rows[0]
 
+    def _get_signature_text(self, entity_id: int) -> str:
+        """Return the stored signature text for entity_id, or empty string."""
+        row = self._conn.execute(
+            "SELECT text_body FROM entity_text "
+            "WHERE entity_id = ? AND text_kind = 'signature' LIMIT 1",
+            (entity_id,),
+        ).fetchone()
+        return row["text_body"] if row else ""
+
     def _upsert_text_callable_review(
         self,
         entity_id: int,
@@ -1697,7 +1829,14 @@ class CodeIndexDb:
         Updates the most-recent row (highest id) if one exists; inserts if not.
         This keeps one authoritative review row per entity while allowing
         approve/reject to override a prior decision.
+
+        arg_textish_status and return_textish_status are derived mechanically
+        from the stored signature text via _check_signature_textish rather
+        than being assumed 'textish'.
         """
+        sig_text = self._get_signature_text(entity_id)
+        arg_textish, ret_textish = _check_signature_textish(sig_text)
+
         existing = self._conn.execute(
             "SELECT id FROM text_callable_review "
             "WHERE entity_id = ? ORDER BY id DESC LIMIT 1",
@@ -1709,9 +1848,10 @@ class CodeIndexDb:
                 "(entity_id, signature_hash, body_hash, docstring_status, "
                 " arg_textish_status, return_textish_status, exposure_status, "
                 " review_note, reviewed_by, reviewed_at) "
-                "VALUES (?, ?, ?, ?, 'textish', 'textish', ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     entity_id, sig_hash, body_hash, docstring_status,
+                    arg_textish, ret_textish,
                     exposure_status, note or None, reviewer or None, _utcnow(),
                 ),
             )
@@ -1720,13 +1860,14 @@ class CodeIndexDb:
                 "UPDATE text_callable_review "
                 "SET signature_hash = ?, body_hash = ?, "
                 "    docstring_status = ?, "
-                "    arg_textish_status = 'textish', "
-                "    return_textish_status = 'textish', "
+                "    arg_textish_status = ?, "
+                "    return_textish_status = ?, "
                 "    exposure_status = ?, "
                 "    review_note = ?, reviewed_by = ?, reviewed_at = ? "
                 "WHERE id = ?",
                 (
                     sig_hash, body_hash, docstring_status,
+                    arg_textish, ret_textish,
                     exposure_status, note or None, reviewer or None, _utcnow(),
                     existing["id"],
                 ),
@@ -1843,14 +1984,19 @@ class CodeIndexDb:
                 continue
 
             docstring_status = "reviewed" if row["has_docstring"] else "missing"
+            sig_text = self._get_signature_text(row["entity_id"])
+            arg_textish, ret_textish = _check_signature_textish(sig_text)
             self._conn.execute(
                 "INSERT INTO text_callable_review "
                 "(entity_id, signature_hash, body_hash, docstring_status, "
                 " arg_textish_status, return_textish_status, exposure_status, "
                 " review_note, reviewed_by, reviewed_at) "
-                "VALUES (?, ?, ?, ?, 'textish', 'textish', 'approved', "
+                "VALUES (?, ?, ?, ?, ?, ?, 'approved', "
                 " 'bootstrap seed', 'bootstrap', ?)",
-                (row["entity_id"], sig_hash, body_hash, docstring_status, _utcnow()),
+                (
+                    row["entity_id"], sig_hash, body_hash, docstring_status,
+                    arg_textish, ret_textish, _utcnow(),
+                ),
             )
             approved.append(qname)
 
